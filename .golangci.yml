@@ -55,6 +55,10 @@ linters:
     wrapcheck:
       extra-ignore-sigs:
         - (context.Context).Err(
+      # Errors from this module's own packages are already wrapped with
+      # the attempted action where they occur.
+      ignore-package-globs:
+        - github.com/ttab/distconf*
   exclusions:
     generated: lax
     rules:

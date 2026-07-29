@@ -1,17 +1,15 @@
-package distconf
+package distribution
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/akedrou/textdiff"
-	"github.com/ttab/eleconf"
+	"github.com/ttab/distconf"
 	dist "github.com/ttab/elephant-public-api/distribution"
-	"github.com/ttab/revisor"
 )
 
 // Clients provides access to the distribution Twirp API.
@@ -42,7 +40,7 @@ type Plan struct {
 
 	// Changes describes the diff between the active generation and the
 	// desired one, for display purposes.
-	Changes []ConfigurationChange
+	Changes []distconf.ConfigurationChange
 
 	// DesiredSchemas, DesiredTypes, and DesiredRenditions form the full
 	// payload that will be sent to RegisterConfigGeneration.
@@ -68,10 +66,11 @@ func BuildPlan(
 	ctx context.Context,
 	clients Clients,
 	conf *Config,
-	schemas []LoadedSchema,
+	schemas []distconf.LoadedSchema,
 	description string,
 ) (*Plan, error) {
-	if err := validateConfigTypes(conf, schemas); err != nil {
+	err := validateConfigTypes(conf, schemas)
+	if err != nil {
 		return nil, err
 	}
 
@@ -84,7 +83,7 @@ func BuildPlan(
 	}
 
 	var (
-		activeSchemas    map[string]*dist.ConfigGenerationSchema
+		activeSchemas    []distconf.SchemaRef
 		activeTypes      map[string]*dist.ConfigGenerationType
 		activeRenditions map[string]*dist.RenditionConfiguration
 		currentID        int64
@@ -94,10 +93,14 @@ func BuildPlan(
 		currentID = active.Generation.Id
 
 		activeSchemas = make(
-			map[string]*dist.ConfigGenerationSchema,
-			len(active.Generation.Schemas))
+			[]distconf.SchemaRef,
+			0, len(active.Generation.Schemas))
 		for _, sc := range active.Generation.Schemas {
-			activeSchemas[sc.Name] = sc
+			activeSchemas = append(activeSchemas, distconf.SchemaRef{
+				Name:    sc.Name,
+				Version: sc.Version,
+				Spec:    sc.Spec,
+			})
 		}
 
 		activeTypes = make(
@@ -120,7 +123,18 @@ func BuildPlan(
 		return nil, err
 	}
 
-	desiredSchemas, schemaChanges := planSchemas(schemas, activeSchemas)
+	desiredRefs, schemaChanges := distconf.PlanSchemas(schemas, activeSchemas)
+
+	desiredSchemas := make(
+		[]*dist.ConfigGenerationSchema, len(desiredRefs))
+	for i, ref := range desiredRefs {
+		desiredSchemas[i] = &dist.ConfigGenerationSchema{
+			Name:    ref.Name,
+			Version: ref.Version,
+			Spec:    ref.Spec,
+		}
+	}
+
 	desiredTypes, typeChanges := planTypes(conf, activeTypes)
 
 	desiredRenditions, renditionChanges, err := planRenditions(
@@ -167,129 +181,23 @@ func (p *Plan) Execute(
 
 // validateConfigTypes verifies that every document type configured in the
 // HCL files is declared by one of the loaded schemas.
-func validateConfigTypes(conf *Config, schemas []LoadedSchema) error {
-	declared, err := declaredTypes(schemas)
-	if err != nil {
-		return err
+func validateConfigTypes(conf *Config, schemas []distconf.LoadedSchema) error {
+	types := make([]string, len(conf.Documents))
+	for i, doc := range conf.Documents {
+		types[i] = doc.Type
 	}
 
-	var undeclared []string
-
-	for _, doc := range conf.Documents {
-		if declared[doc.Type] {
-			continue
-		}
-
-		undeclared = append(undeclared, doc.Type)
-	}
-
-	if len(undeclared) == 0 {
-		return nil
-	}
-
-	sort.Strings(undeclared)
-
-	quoted := make([]string, len(undeclared))
-	for i, t := range undeclared {
-		quoted[i] = fmt.Sprintf("%q", t)
-	}
-
-	return fmt.Errorf(
-		"undeclared document types: %s (not declared in any schema)",
-		strings.Join(quoted, ", "))
-}
-
-func declaredTypes(schemas []LoadedSchema) (map[string]bool, error) {
-	types := make(map[string]bool)
-
-	for _, sc := range schemas {
-		var spec revisor.ConstraintSet
-
-		err := json.Unmarshal(sc.Data, &spec)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"unmarshal schema %q: %w", sc.Lock.Name, err)
-		}
-
-		for _, doc := range spec.Documents {
-			if doc.Declares == "" {
-				continue
-			}
-
-			types[doc.Declares] = true
-		}
-	}
-
-	return types, nil
-}
-
-func planSchemas(
-	want []LoadedSchema,
-	active map[string]*dist.ConfigGenerationSchema,
-) ([]*dist.ConfigGenerationSchema, []ConfigurationChange) {
-	desired := make([]*dist.ConfigGenerationSchema, 0, len(want))
-	seen := make(map[string]bool, len(want))
-
-	var changes []ConfigurationChange
-
-	for _, sc := range want {
-		seen[sc.Lock.Name] = true
-
-		entry := &dist.ConfigGenerationSchema{
-			Name:    sc.Lock.Name,
-			Version: sc.Lock.Version,
-			Spec:    string(sc.Data),
-		}
-
-		desired = append(desired, entry)
-
-		curr, ok := active[sc.Lock.Name]
-		switch {
-		case !ok:
-			changes = append(changes, &schemaPlanChange{
-				name:    sc.Lock.Name,
-				wanted:  sc.Lock.Version,
-				op:      OpAdd,
-				message: fmt.Sprintf("add schema %s@%s", sc.Lock.Name, sc.Lock.Version),
-			})
-		case curr.Version != sc.Lock.Version:
-			changes = append(changes, &schemaPlanChange{
-				name:    sc.Lock.Name,
-				wanted:  sc.Lock.Version,
-				current: curr.Version,
-				op:      OpUpdate,
-				message: fmt.Sprintf(
-					"upgrade schema %s %s => %s",
-					sc.Lock.Name, curr.Version, sc.Lock.Version),
-			})
-		}
-	}
-
-	// Anything in the active gen not in the desired set is being removed.
-	for name, sc := range active {
-		if seen[name] {
-			continue
-		}
-
-		changes = append(changes, &schemaPlanChange{
-			name:    name,
-			current: sc.Version,
-			op:      OpRemove,
-			message: fmt.Sprintf("remove schema %s@%s", name, sc.Version),
-		})
-	}
-
-	return desired, changes
+	return distconf.ValidateDeclaredTypes(types, schemas)
 }
 
 func planTypes(
 	conf *Config,
 	active map[string]*dist.ConfigGenerationType,
-) ([]*dist.ConfigGenerationType, []ConfigurationChange) {
+) ([]*dist.ConfigGenerationType, []distconf.ConfigurationChange) {
 	desired := make([]*dist.ConfigGenerationType, 0, len(conf.Documents))
 	seen := make(map[string]bool, len(conf.Documents))
 
-	var changes []ConfigurationChange
+	var changes []distconf.ConfigurationChange
 
 	for _, doc := range conf.Documents {
 		seen[doc.Type] = true
@@ -311,7 +219,7 @@ func planTypes(
 			changes = append(changes, &typePlanChange{
 				docType: doc.Type,
 				wanted:  doc.TransformScript,
-				op:      OpAdd,
+				op:      distconf.OpAdd,
 			})
 		default:
 			currConf := curr.Configuration
@@ -328,7 +236,7 @@ func planTypes(
 					current:      currConf.TransformScript,
 					wanted:       doc.TransformScript,
 					settingsDiff: settingsDiff,
-					op:           OpUpdate,
+					op:           distconf.OpUpdate,
 				})
 			}
 		}
@@ -347,7 +255,7 @@ func planTypes(
 		changes = append(changes, &typePlanChange{
 			docType: typ,
 			current: current,
-			op:      OpRemove,
+			op:      distconf.OpRemove,
 		})
 	}
 
@@ -363,11 +271,11 @@ func planRenditions(
 	conf *Config,
 	active map[string]*dist.RenditionConfiguration,
 	renditionTypes map[string]bool,
-) ([]*dist.RenditionConfiguration, []ConfigurationChange, error) {
+) ([]*dist.RenditionConfiguration, []distconf.ConfigurationChange, error) {
 	desired := make([]*dist.RenditionConfiguration, 0, len(conf.Renditions))
 	seen := make(map[string]bool, len(conf.Renditions))
 
-	var changes []ConfigurationChange
+	var changes []distconf.ConfigurationChange
 
 	for _, rc := range conf.Renditions {
 		seen[rc.Kind] = true
@@ -388,7 +296,7 @@ func planRenditions(
 			changes = append(changes, &renditionPlanChange{
 				kind:     rc.Kind,
 				wanted:   wanted,
-				op:       OpAdd,
+				op:       distconf.OpAdd,
 				warnings: warnings,
 			})
 
@@ -406,7 +314,7 @@ func planRenditions(
 				kind:     rc.Kind,
 				current:  current,
 				wanted:   wanted,
-				op:       OpUpdate,
+				op:       distconf.OpUpdate,
 				warnings: warnings,
 			})
 		}
@@ -419,7 +327,7 @@ func planRenditions(
 
 		changes = append(changes, &renditionPlanChange{
 			kind: kind,
-			op:   OpRemove,
+			op:   distconf.OpRemove,
 		})
 	}
 
@@ -530,7 +438,7 @@ func renditionSchemaWarnings(
 // renditionLinkTypes collects the block types for which some schema
 // declares a rel "rendition" link.
 func renditionLinkTypes(
-	schemas []LoadedSchema,
+	schemas []distconf.LoadedSchema,
 ) (map[string]bool, error) {
 	types := make(map[string]bool)
 
@@ -622,46 +530,30 @@ type renditionPlanChange struct {
 	kind     string
 	current  string
 	wanted   string
-	op       ChangeOp
+	op       distconf.ChangeOp
 	warnings []string
 }
 
-func (c *renditionPlanChange) Describe() (ChangeOp, string) {
+func (c *renditionPlanChange) Describe() (distconf.ChangeOp, string) {
 	switch c.op {
-	case OpAdd:
-		return OpAdd, fmt.Sprintf(
+	case distconf.OpAdd:
+		return distconf.OpAdd, fmt.Sprintf(
 			"configure %q renditions:\n%s", c.kind, c.wanted)
-	case OpRemove:
-		return OpRemove, fmt.Sprintf(
+	case distconf.OpRemove:
+		return distconf.OpRemove, fmt.Sprintf(
 			"remove %q rendition configuration", c.kind)
-	case OpUpdate:
+	case distconf.OpUpdate:
 	}
 
 	diff := textdiff.Unified("current", "wanted", c.current, c.wanted)
 
-	return OpUpdate, fmt.Sprintf(
+	return distconf.OpUpdate, fmt.Sprintf(
 		"update %q rendition configuration:\n%s",
 		c.kind, strings.TrimRight(diff, "\n"))
 }
 
 func (c *renditionPlanChange) Warnings() []string {
 	return c.warnings
-}
-
-type schemaPlanChange struct {
-	name    string
-	current string
-	wanted  string
-	op      ChangeOp
-	message string
-}
-
-func (c *schemaPlanChange) Describe() (ChangeOp, string) {
-	return c.op, c.message
-}
-
-func (c *schemaPlanChange) Warnings() []string {
-	return nil
 }
 
 // typeSettingsDiff describes changes to the non-script type settings,
@@ -690,46 +582,46 @@ type typePlanChange struct {
 	current      string
 	wanted       string
 	settingsDiff string
-	op           ChangeOp
+	op           distconf.ChangeOp
 }
 
-func (c *typePlanChange) Describe() (ChangeOp, string) {
+func (c *typePlanChange) Describe() (distconf.ChangeOp, string) {
 	switch c.op {
-	case OpAdd:
+	case distconf.OpAdd:
 		if c.wanted != "" {
-			return OpAdd, fmt.Sprintf(
+			return distconf.OpAdd, fmt.Sprintf(
 				"configure type %q with transform script", c.docType)
 		}
 
-		return OpAdd, fmt.Sprintf("configure type %q", c.docType)
-	case OpRemove:
-		return OpRemove, fmt.Sprintf(
+		return distconf.OpAdd, fmt.Sprintf("configure type %q", c.docType)
+	case distconf.OpRemove:
+		return distconf.OpRemove, fmt.Sprintf(
 			"remove type configuration for %q", c.docType)
-	case OpUpdate:
+	case distconf.OpUpdate:
 	}
 
 	if c.current == c.wanted {
-		return OpUpdate, fmt.Sprintf(
+		return distconf.OpUpdate, fmt.Sprintf(
 			"update settings for %q:\n%s",
 			c.docType, c.settingsDiff)
 	}
 
-	var op ChangeOp
+	var op distconf.ChangeOp
 
 	var message string
 
 	switch {
 	case c.current == "" && c.wanted != "":
-		op = OpAdd
+		op = distconf.OpAdd
 		message = fmt.Sprintf("set transform script for %q", c.docType)
 	case c.wanted == "":
-		op = OpRemove
+		op = distconf.OpRemove
 		message = fmt.Sprintf("remove transform script for %q", c.docType)
 	default:
 		diff := textdiff.Unified("current", "wanted",
 			c.current, c.wanted)
 
-		op = OpUpdate
+		op = distconf.OpUpdate
 		message = fmt.Sprintf(
 			"update transform script for %q:\n%s",
 			c.docType, strings.TrimRight(diff, "\n"))
@@ -744,41 +636,4 @@ func (c *typePlanChange) Describe() (ChangeOp, string) {
 
 func (c *typePlanChange) Warnings() []string {
 	return nil
-}
-
-// LockFilePath returns the path to the schema lock file in the given
-// directory.
-func LockFilePath(dir string) string {
-	return eleconf.LockFilePath(dir)
-}
-
-// LoadLockFile loads a schema lockfile from disk.
-func LoadLockFile(fileName string) (*eleconf.SchemaLockfile, error) {
-	lf, err := eleconf.LoadLockFile(fileName)
-	if err != nil {
-		return nil, fmt.Errorf("load lock file: %w", err)
-	}
-
-	return lf, nil
-}
-
-// NewSchemaLockFile creates a new lockfile from loaded schemas.
-func NewSchemaLockFile(loaded []LoadedSchema) *eleconf.SchemaLockfile {
-	return eleconf.NewSchemaLockFile(loaded, nil)
-}
-
-// LoadSchemaSet loads the schemas in a schema set, validating against the
-// lockfile.
-func LoadSchemaSet(
-	ctx context.Context,
-	set eleconf.SchemaSet,
-	lockfile *eleconf.SchemaLockfile,
-	init bool,
-) ([]LoadedSchema, error) {
-	schemas, err := eleconf.LoadSchemaSet(ctx, set, lockfile, init)
-	if err != nil {
-		return nil, fmt.Errorf("load schema set: %w", err)
-	}
-
-	return schemas, nil
 }

@@ -8,7 +8,7 @@ require (
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/ttab/clitools v1.0.4-0.20260427190724-91a2ef290e9f
 	github.com/ttab/eleconf v1.1.1
-	github.com/ttab/elephant-public-api v0.0.2
+	github.com/ttab/elephant-public-api v0.0.3
 	github.com/ttab/elephantine v0.27.2
 	github.com/ttab/revisor v1.0.0
 	github.com/urfave/cli/v3 v3.10.1
@@ -72,8 +72,8 @@ require (
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	github.com/sergi/go-diff v1.4.0 // indirect
 	github.com/skeema/knownhosts v1.3.2 // indirect
-	github.com/ttab/elephant-api v0.22.1 // indirect
-	github.com/ttab/newsdoc v1.0.0 // indirect
+	github.com/ttab/elephant-api v0.24.2 // indirect
+	github.com/ttab/newsdoc v1.1.0 // indirect
 	github.com/twitchtv/twirp v8.1.3+incompatible // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	github.com/zclconf/go-cty v1.18.0 // indirect

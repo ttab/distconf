@@ -49,7 +49,7 @@ func syncCommand(authFlags []cli.Flag) *cli.Command {
 // state.
 func setSyncStateAction(desired string) cli.ActionFunc {
 	return func(ctx context.Context, c *cli.Command) error {
-		clients, err := getClients(ctx, c)
+		clients, err := getDistributionClients(ctx, c)
 		if err != nil {
 			return fmt.Errorf("get API clients: %w", err)
 		}
@@ -69,7 +69,7 @@ func setSyncStateAction(desired string) cli.ActionFunc {
 // syncStatusAction prints the desired and current sync worker state and
 // its position in the repository eventlog.
 func syncStatusAction(ctx context.Context, c *cli.Command) error {
-	clients, err := getClients(ctx, c)
+	clients, err := getDistributionClients(ctx, c)
 	if err != nil {
 		return fmt.Errorf("get API clients: %w", err)
 	}

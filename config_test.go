@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ttab/distconf"
+	"github.com/ttab/eleconf"
 )
 
 func writeConfigDir(t *testing.T, files map[string]string) string {
@@ -24,175 +25,139 @@ func writeConfigDir(t *testing.T, files map[string]string) string {
 	return dir
 }
 
-const imageRenditionsHCL = `
-renditions "image" {
-  default_variants  = ["thumbnail", "preview", "hires"]
-  default_extension = "jpg"
-
-  source "tt-archive" {
-    namespace   = "mm"
-    link_types  = ["tt/picture", "tt/graphic"]
-    uri_pattern = "^https?://tt\\.se/media/image/sdl([A-Za-z0-9._-]+)$"
-  }
-
-  source "repo" {
-    namespace   = "repo"
-    block_types = ["core/image"]
-    link_rel    = "image"
-    uri_pattern = "^repo://([A-Za-z0-9._-]+)$"
-  }
-}
-`
-
-func TestReadConfigRenditions(t *testing.T) {
+// TestReadDirectoryInfo verifies that the service-independent parts of a
+// configuration directory are read while service-specific blocks are
+// ignored.
+func TestReadDirectoryInfo(t *testing.T) {
 	dir := writeConfigDir(t, map[string]string{
-		"renditions.hcl": imageRenditionsHCL,
-	})
-
-	conf, err := distconf.ReadConfigFromDirectory(dir)
-	if err != nil {
-		t.Fatalf("read config: %v", err)
-	}
-
-	if len(conf.Renditions) != 1 {
-		t.Fatalf("got %d renditions blocks, want 1", len(conf.Renditions))
-	}
-
-	r := conf.Renditions[0]
-
-	if r.Kind != "image" {
-		t.Errorf("got kind %q, want image", r.Kind)
-	}
-
-	if r.DefaultExtension != "jpg" {
-		t.Errorf("got extension %q, want jpg", r.DefaultExtension)
-	}
-
-	if len(r.DefaultVariants) != 3 {
-		t.Errorf("got variants %v, want 3", r.DefaultVariants)
-	}
-
-	if len(r.Sources) != 2 {
-		t.Fatalf("got %d sources, want 2", len(r.Sources))
-	}
-
-	// Source order carries meaning (first match wins), so the
-	// declaration order must be preserved.
-	if r.Sources[0].Name != "tt-archive" || r.Sources[1].Name != "repo" {
-		t.Errorf("source order not preserved: %q, %q",
-			r.Sources[0].Name, r.Sources[1].Name)
-	}
-
-	if r.Sources[1].LinkRel != "image" ||
-		len(r.Sources[1].BlockTypes) != 1 {
-		t.Errorf("source fields not decoded: %+v", r.Sources[1])
-	}
+		"main.hcl": `
+configuration {
+  service = "distribution"
+  version = 1
 }
-
-func TestReadConfigRenditionsMultiFileMerge(t *testing.T) {
-	dir := writeConfigDir(t, map[string]string{
-		"image.hcl": imageRenditionsHCL,
-		"audio.hcl": `
-renditions "audio" {
-  default_variants = ["clip"]
-
-  source "repo" {
-    namespace   = "repo"
-    block_types = ["core/audio"]
-    link_rel    = "audio"
-    uri_pattern = "^repo://([A-Za-z0-9._-]+)$"
-  }
+`,
+		"schemas.hcl": `
+schema_set "public" {
+  version    = "v0.0.4"
+  repository = "https://example.com/schemas.git"
+  schemas    = ["se.ecms.dist"]
+}
+`,
+		"documents.hcl": `
+document "core/article" {
+  transform_file = "article.ts"
 }
 `,
 	})
 
-	conf, err := distconf.ReadConfigFromDirectory(dir)
+	info, err := distconf.ReadDirectoryInfo(dir)
 	if err != nil {
-		t.Fatalf("read config: %v", err)
+		t.Fatalf("read directory info: %v", err)
 	}
 
-	if len(conf.Renditions) != 2 {
-		t.Fatalf("got %d renditions blocks, want 2", len(conf.Renditions))
+	if info.Configuration.Service != "distribution" {
+		t.Errorf("got service %q, want distribution",
+			info.Configuration.Service)
+	}
+
+	if info.Configuration.Version != 1 {
+		t.Errorf("got version %d, want 1", info.Configuration.Version)
+	}
+
+	if len(info.SchemaSets) != 1 {
+		t.Errorf("got %d schema sets, want 1", len(info.SchemaSets))
 	}
 }
 
-func TestReadConfigRenditionsDuplicateKind(t *testing.T) {
+func TestReadDirectoryInfoMissingConfiguration(t *testing.T) {
 	dir := writeConfigDir(t, map[string]string{
-		"one.hcl": imageRenditionsHCL,
-		"two.hcl": imageRenditionsHCL,
+		"schemas.hcl": "",
 	})
 
-	_, err := distconf.ReadConfigFromDirectory(dir)
+	_, err := distconf.ReadDirectoryInfo(dir)
 	if err == nil {
-		t.Fatal("expected an error for a kind declared in two files")
+		t.Fatal("expected an error for a missing configuration block")
 	}
 
-	if !strings.Contains(err.Error(), "declared more than once") {
+	if !strings.Contains(err.Error(), "no configuration block") {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
 
-// TestReadConfigExample parses the example directory shipped with the
-// repository. The README points operators at it, so it has to stay
-// loadable as the configuration format evolves.
-func TestReadConfigExample(t *testing.T) {
-	dir := filepath.Join("testdata", "config-example")
-
-	conf, err := distconf.ReadConfigFromDirectory(dir)
-	if err != nil {
-		t.Fatalf("read config: %v", err)
-	}
-
-	if len(conf.SchemaSets) == 0 {
-		t.Error("no schema sets in the example configuration")
-	}
-
-	if len(conf.Renditions) == 0 {
-		t.Error("no renditions blocks in the example configuration")
-	}
-
-	var withScript int
-
-	for _, doc := range conf.Documents {
-		if doc.TransformScript != "" {
-			withScript++
-		}
-	}
-
-	// transform_file references have to be resolved relative to the
-	// configuration directory.
-	if withScript == 0 {
-		t.Error("no document in the example resolved a transform script")
-	}
+func TestReadDirectoryInfoDuplicateConfiguration(t *testing.T) {
+	confBlock := `
+configuration {
+  service = "distribution"
+  version = 1
 }
+`
 
-func TestReadConfigDocumentSettings(t *testing.T) {
 	dir := writeConfigDir(t, map[string]string{
-		"doc.hcl": `
-document "core/article" {
-  transform_script   = "function transform(doc) { return doc }"
-  bounded_collection = true
-  variants           = ["web", "print"]
-}
-`,
+		"one.hcl": confBlock,
+		"two.hcl": confBlock,
 	})
 
-	conf, err := distconf.ReadConfigFromDirectory(dir)
-	if err != nil {
-		t.Fatalf("read config: %v", err)
+	_, err := distconf.ReadDirectoryInfo(dir)
+	if err == nil {
+		t.Fatal("expected an error for duplicate configuration blocks")
 	}
 
-	if len(conf.Documents) != 1 {
-		t.Fatalf("got %d documents, want 1", len(conf.Documents))
+	if !strings.Contains(err.Error(), "only one may be declared") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestPlanSchemas(t *testing.T) {
+	want := []distconf.LoadedSchema{
+		{
+			Lock: eleconf.SchemaLock{
+				Name:    "se.ecms.dist",
+				Version: "v0.0.5",
+			},
+			Data: []byte(`{}`),
+		},
+		{
+			Lock: eleconf.SchemaLock{
+				Name:    "se.ecms.live",
+				Version: "v0.0.5",
+			},
+			Data: []byte(`{}`),
+		},
 	}
 
-	doc := conf.Documents[0]
-
-	if !doc.BoundedCollection {
-		t.Error("bounded_collection not decoded")
+	active := []distconf.SchemaRef{
+		{Name: "se.ecms.dist", Version: "v0.0.4", Spec: "{}"},
+		{Name: "se.tt.dist", Version: "v0.0.4", Spec: "{}"},
 	}
 
-	if len(doc.Variants) != 2 {
-		t.Errorf("variants not decoded: %v", doc.Variants)
+	desired, changes := distconf.PlanSchemas(want, active)
+
+	if len(desired) != 2 {
+		t.Fatalf("got %d desired schemas, want 2", len(desired))
+	}
+
+	// One upgrade, one add, one remove.
+	if len(changes) != 3 {
+		t.Fatalf("got %d changes, want 3", len(changes))
+	}
+
+	var ops []string
+
+	for _, change := range changes {
+		op, msg := change.Describe()
+
+		ops = append(ops, string(op)+" "+msg)
+	}
+
+	joined := strings.Join(ops, "\n")
+
+	for _, wanted := range []string{
+		"~ upgrade schema se.ecms.dist v0.0.4 => v0.0.5",
+		"+ add schema se.ecms.live@v0.0.5",
+		"- remove schema se.tt.dist@v0.0.4",
+	} {
+		if !strings.Contains(joined, wanted) {
+			t.Errorf("missing change %q in:\n%s", wanted, joined)
+		}
 	}
 }

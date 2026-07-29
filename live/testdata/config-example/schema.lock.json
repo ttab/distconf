@@ -1,0 +1,20 @@
+{
+  "updated": "2026-07-29T16:09:46.72233432+02:00",
+  "schemas": {
+    "se.ecms.dist": {
+      "name": "se.ecms.dist",
+      "version": "v0.0.6",
+      "hash": "f180b4b34ed50ee56d3ca018a101beba6057a9f5082a1f510ff5ac538917f0f3"
+    },
+    "se.ecms.live": {
+      "name": "se.ecms.live",
+      "version": "v0.0.6",
+      "hash": "5975874d71436ee67a5bcbf18ae50e7ffd33b310691397fb845b5d2b6397bea9"
+    },
+    "se.tt.dist": {
+      "name": "se.tt.dist",
+      "version": "v0.0.6",
+      "hash": "d8504f7f718b4d15b3963f93718e4b6d10b699e00787cc1ef928218a35d25712"
+    }
+  }
+}

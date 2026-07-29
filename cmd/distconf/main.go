@@ -12,6 +12,9 @@ import (
 	"github.com/fatih/color"
 	"github.com/ttab/clitools"
 	"github.com/ttab/distconf"
+	"github.com/ttab/distconf/distribution"
+	"github.com/ttab/distconf/live"
+	"github.com/ttab/eleconf"
 	"github.com/ttab/elephantine"
 	"github.com/urfave/cli/v3"
 )
@@ -84,12 +87,20 @@ func main() {
 		}, authFlags...),
 	}
 
+	distributionCmd := cli.Command{
+		Name:        "distribution",
+		Description: "Commands specific to the distribution service",
+		Commands: []*cli.Command{
+			syncCommand(authFlags),
+		},
+	}
+
 	configureCmd := clitools.ConfigureCliCommands(
 		appName, clitools.DefaultApplicationID)
 
 	cmd := cli.Command{
 		Name:  "distconf",
-		Usage: "Distribution configuration tool",
+		Usage: "Elephant configuration tool",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "env",
@@ -100,7 +111,7 @@ func main() {
 			&versionCmd,
 			&updateCmd,
 			&applyCmd,
-			syncCommand(authFlags),
+			&distributionCmd,
 			configureCmd,
 		},
 	}
@@ -111,12 +122,80 @@ func main() {
 	}
 }
 
+// serviceConfig is a configuration directory parsed with the loader for
+// the service its configuration block targets. Exactly one of the
+// service fields is set.
+type serviceConfig struct {
+	SchemaSets   []eleconf.SchemaSet
+	Distribution *distribution.Config
+	Live         *live.Config
+}
+
+// loadServiceConfig identifies the service a configuration directory
+// targets and parses it with the corresponding config loader.
+func loadServiceConfig(dir string) (*serviceConfig, error) {
+	info, err := distconf.ReadDirectoryInfo(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read configuration: %w", err)
+	}
+
+	switch info.Configuration.Service {
+	case distribution.ServiceName:
+		conf, err := distribution.ReadConfigFromDirectory(dir)
+		if err != nil {
+			return nil, fmt.Errorf("read configuration: %w", err)
+		}
+
+		return &serviceConfig{
+			SchemaSets:   conf.SchemaSets,
+			Distribution: conf,
+		}, nil
+	case live.ServiceName:
+		conf, err := live.ReadConfigFromDirectory(dir)
+		if err != nil {
+			return nil, fmt.Errorf("read configuration: %w", err)
+		}
+
+		return &serviceConfig{
+			SchemaSets: conf.SchemaSets,
+			Live:       conf,
+		}, nil
+	default:
+		return nil, fmt.Errorf(
+			"the configuration targets the unknown service %q",
+			info.Configuration.Service)
+	}
+}
+
+// loadSchemas loads the schemas of all schema sets, validating against
+// the lockfile unless init is set.
+func loadSchemas(
+	ctx context.Context,
+	sets []eleconf.SchemaSet,
+	lock *eleconf.SchemaLockfile,
+	init bool,
+) ([]distconf.LoadedSchema, error) {
+	var schemas []distconf.LoadedSchema
+
+	for _, set := range sets {
+		loaded, err := distconf.LoadSchemaSet(ctx, set, lock, init)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"load schema set %q: %w", set.Name, err)
+		}
+
+		schemas = append(schemas, loaded...)
+	}
+
+	return schemas, nil
+}
+
 func updateAction(ctx context.Context, c *cli.Command) error {
 	dir := c.String("dir")
 
-	conf, err := distconf.ReadConfigFromDirectory(dir)
+	conf, err := loadServiceConfig(dir)
 	if err != nil {
-		return fmt.Errorf("read configuration: %w", err)
+		return err
 	}
 
 	lock, err := distconf.LoadLockFile(distconf.LockFilePath(dir))
@@ -124,16 +203,9 @@ func updateAction(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("load lock file: %w", err)
 	}
 
-	var schemas []distconf.LoadedSchema
-
-	for _, set := range conf.SchemaSets {
-		loaded, err := distconf.LoadSchemaSet(ctx, set, lock, true)
-		if err != nil {
-			return fmt.Errorf(
-				"load schema set %q: %w", set.Name, err)
-		}
-
-		schemas = append(schemas, loaded...)
+	schemas, err := loadSchemas(ctx, conf.SchemaSets, lock, true)
+	if err != nil {
+		return err
 	}
 
 	lock = distconf.NewSchemaLockFile(schemas)
@@ -150,9 +222,9 @@ func applyAction(ctx context.Context, c *cli.Command) error {
 	dir := c.String("dir")
 	description := c.String("description")
 
-	conf, err := distconf.ReadConfigFromDirectory(dir)
+	conf, err := loadServiceConfig(dir)
 	if err != nil {
-		return fmt.Errorf("read configuration: %w", err)
+		return err
 	}
 
 	lock, err := distconf.LoadLockFile(distconf.LockFilePath(dir))
@@ -162,41 +234,84 @@ func applyAction(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("load lock file: %w", err)
 	}
 
-	var schemas []distconf.LoadedSchema
+	schemas, err := loadSchemas(ctx, conf.SchemaSets, lock, false)
+	if err != nil {
+		return err
+	}
 
-	for _, set := range conf.SchemaSets {
-		loaded, err := distconf.LoadSchemaSet(ctx, set, lock, false)
+	switch {
+	case conf.Distribution != nil:
+		clients, err := getDistributionClients(ctx, c)
 		if err != nil {
-			return fmt.Errorf(
-				"load schema set %q: %w", set.Name, err)
+			return fmt.Errorf("get API clients: %w", err)
 		}
 
-		schemas = append(schemas, loaded...)
+		plan, err := distribution.BuildPlan(
+			ctx, clients, conf.Distribution, schemas, description)
+		if err != nil {
+			return fmt.Errorf("build plan: %w", err)
+		}
+
+		return executePlan(plan.Changes, plan.CurrentGenerationID,
+			func() (string, error) {
+				gen, err := plan.Execute(ctx, clients)
+				if err != nil {
+					return "", err
+				}
+
+				return fmt.Sprintf(
+					"Activated generation %d (%d schemas, %d type configurations)",
+					gen.Id, len(gen.Schemas), len(gen.Types)), nil
+			})
+	case conf.Live != nil:
+		clients, err := getLiveClients(ctx, c)
+		if err != nil {
+			return fmt.Errorf("get API clients: %w", err)
+		}
+
+		plan, err := live.BuildPlan(
+			ctx, clients, conf.Live, schemas, description)
+		if err != nil {
+			return fmt.Errorf("build plan: %w", err)
+		}
+
+		return executePlan(plan.Changes, plan.CurrentGenerationID,
+			func() (string, error) {
+				gen, err := plan.Execute(ctx, clients)
+				if err != nil {
+					return "", err
+				}
+
+				return fmt.Sprintf(
+					"Activated generation %d (%d schemas, %d post types)",
+					gen.Id, len(gen.Schemas), len(gen.PostTypes)), nil
+			})
 	}
 
-	clients, err := getClients(ctx, c)
-	if err != nil {
-		return fmt.Errorf("get API clients: %w", err)
-	}
+	return errors.New("no service configuration loaded")
+}
 
-	plan, err := distconf.BuildPlan(ctx, clients, conf, schemas, description)
-	if err != nil {
-		return fmt.Errorf("build plan: %w", err)
-	}
-
-	printChanges(plan.Changes)
+// executePlan prints the plan diff and current state, asks for
+// confirmation if the plan would change anything, and runs execute. The
+// summary returned by execute is printed on success.
+func executePlan(
+	changes []distconf.ConfigurationChange,
+	currentGenerationID int64,
+	execute func() (string, error),
+) error {
+	printChanges(changes)
 
 	fmt.Fprintln(os.Stdout)
 
-	if plan.CurrentGenerationID != 0 {
+	if currentGenerationID != 0 {
 		fmt.Fprintf(os.Stdout,
 			"Current active generation: %d\n",
-			plan.CurrentGenerationID)
+			currentGenerationID)
 	} else {
 		fmt.Fprintln(os.Stdout, "No generation is currently active.")
 	}
 
-	if !plan.HasChanges() && plan.CurrentGenerationID != 0 {
+	if len(changes) == 0 && currentGenerationID != 0 {
 		fmt.Fprintln(os.Stdout, "No changes needed")
 
 		return nil
@@ -207,15 +322,13 @@ func applyAction(ctx context.Context, c *cli.Command) error {
 		return errors.New("aborted by user")
 	}
 
-	gen, err := plan.Execute(ctx, clients)
+	summary, err := execute()
 	if err != nil {
 		return fmt.Errorf("apply generation: %w", err)
 	}
 
 	fmt.Fprintln(os.Stdout)
-	fmt.Fprintf(os.Stdout,
-		"Activated generation %d (%d schemas, %d type configurations)\n",
-		gen.Id, len(gen.Schemas), len(gen.Types))
+	fmt.Fprintln(os.Stdout, summary)
 
 	return nil
 }

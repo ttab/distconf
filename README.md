@@ -1,13 +1,18 @@
 # distconf
 
-`distconf` is the operator-facing CLI for [Elephant
-distribution](https://github.com/ttab/elephant-distribution). It keeps a
-running distribution service's configuration in sync with a source-controlled
+`distconf` is the operator-facing CLI for configuring Elephant services. It
+keeps a running service's configuration in sync with a source-controlled
 directory of HCL files, so every change to a production environment comes from
 a reviewed commit rather than a hand-made RPC call.
 
-The repository is both a library (`github.com/ttab/distconf` — config parsing,
-plan building, diffing) and the `distconf` binary (`cmd/distconf`).
+Two services are supported so far: [Elephant
+distribution](https://github.com/ttab/elephant-distribution) and [Elephant
+live](https://github.com/ttab/elephant-live).
+
+The repository is both a library (`github.com/ttab/distconf` — shared config
+parsing and schema plan machinery, with service-specific packages
+`distconf/distribution` and `distconf/live`) and the `distconf` binary
+(`cmd/distconf`).
 
 ## Installation
 
@@ -26,16 +31,32 @@ of every schema currently committed. Splitting blocks across files is purely
 organisational — `document` blocks can live in `article.hcl` and
 `taxonomy.hcl`, and both are read.
 
-* **`schema_set`** blocks point at named revisor schemas and the version
-  expected for each:
+Every configuration directory identifies the service it configures with a
+**`configuration`** block, declared exactly once (conventionally in
+`main.hcl`):
 
-  ```hcl
-  schema_set "public" {
-    version    = "v0.0.4"
-    repository = "https://github.com/ttab/dist-revisorschemas.git"
-    schemas    = ["se.ecms.dist", "se.ecms.dist.planning", "se.tt.dist"]
-  }
-  ```
+```hcl
+configuration {
+  service = "distribution"
+  version = 1
+}
+```
+
+`service` selects which service `apply` talks to and which blocks are valid in
+the directory; `version` is the configuration format version (currently `1`).
+
+**`schema_set`** blocks are common to all services. They point at named
+revisor schemas and the version expected for each:
+
+```hcl
+schema_set "public" {
+  version    = "v0.0.4"
+  repository = "https://github.com/ttab/dist-revisorschemas.git"
+  schemas    = ["se.ecms.dist", "se.ecms.dist.planning", "se.tt.dist"]
+}
+```
+
+### Distribution (`service = "distribution"`)
 
 * **`document`** blocks describe per-type configuration: a transform script
   (either inline via `transform_script` or from a file via `transform_file` —
@@ -72,42 +93,58 @@ organisational — `document` blocks can live in `article.hcl` and
   }
   ```
 
-`testdata/config-example/` is a complete, working example of such a directory.
+`distribution/testdata/config-example/` is a complete, working example of
+such a directory.
+
+### Live (`service = "live"`)
+
+* **`post_type`** blocks declare the document types the live service accepts
+  as post content. Every type must be declared by one of the schemas, and a
+  type may only be declared once across the whole directory.
+
+  ```hcl
+  post_type "core/live-post" {}
+  ```
+
+`live/testdata/config-example/` is a complete, working example.
 
 ## Commands
 
 * **`distconf configure --env <name>`** — sets up OIDC credentials and the
-  service base URL for an environment. All server-facing commands then take
+  service base URLs for an environment. All server-facing commands then take
   `--env` to select which environment to talk to. Non-interactive use can
   supply `--client-id` / `--client-secret` (or `CLIENT_ID` / `CLIENT_SECRET`)
-  instead. The CLI requests the `dist_admin` scope.
+  instead. The CLI requests the `dist_admin` scope for distribution commands
+  and `liveblog_admin` for live commands.
 
 * **`distconf update [--dir .]`** — re-resolves the schemas referenced by the
   configuration (fetching them from each schema set's git repository) and
   writes a fresh `schema.lock.json`.
 
 * **`distconf apply [--dir .] [--description "…"]`** — loads the lockfile,
-  schemas, transform scripts and rendition configuration, calls
-  `GetActiveConfigGeneration` to fetch the server's current state, prints a
-  coloured diff, and on confirmation calls `RegisterConfigGeneration` with
-  `activate = true`. The output reports the new generation's ID.
+  schemas and service configuration, calls `GetActiveConfigGeneration` on the
+  service named by the `configuration` block to fetch its current state,
+  prints a coloured diff, and on confirmation calls
+  `RegisterConfigGeneration` with `activate = true`. The output reports the
+  new generation's ID.
 
-* **`distconf sync start|stop|status`** — resumes, pauses, or inspects the
-  distribution service's sync worker. `status` prints the desired state, the
-  state the worker reports, its position in the repository eventlog, and
-  whether it has caught up.
+* **`distconf distribution sync start|stop|status`** — resumes, pauses, or
+  inspects the distribution service's sync worker. `status` prints the
+  desired state, the state the worker reports, its position in the repository
+  eventlog, and whether it has caught up.
 
 * **`distconf version`** — prints the binary version.
 
 ## How `apply` works
 
-Distribution-time configuration is versioned server-side in atomic snapshots
-called **config generations**. A generation pins a set of schemas (each
-`(name, version)`) and a set of per-type configurations, and exactly one
-generation is active at a time. A single `apply` run turns the configuration
-directory into exactly one new generation, so rolling back is a matter of
-activating the previous generation by ID — the old schemas and type configs
-are all still stored.
+Service configuration is versioned server-side in atomic snapshots called
+**config generations**. A generation pins a set of schemas (each
+`(name, version)`) plus the service-specific configuration (per-type
+configurations and renditions for distribution, post types for live), and
+exactly one generation is active at a time. A single `apply` run turns the
+configuration directory into exactly one new generation, so rolling back is a
+matter of activating the previous generation by ID — the old schemas and
+configuration are all still stored.
 
 The diff `apply` prints is display-only; nothing is mutated until you confirm,
 and then the whole generation is registered and activated in one call:
@@ -124,14 +161,15 @@ and then the whole generation is registered and activated in one call:
 - remove type configuration for "core/author"
 ```
 
-`apply` refuses to build a plan for a `document` block whose type isn't
-declared by any schema in the set, which catches typos and types that were
-dropped from a schema upgrade.
+`apply` refuses to build a plan for a `document` or `post_type` block whose
+type isn't declared by any schema in the set, which catches typos and types
+that were dropped from a schema upgrade.
 
-It also **warns** when a rendition source matches a block type for which no
-schema in the generation declares a `rel:"rendition"` link. Delivered
-documents would then carry rendition links the consumer's copy of the schemas
-rejects — the configuration is accepted, but the warning is worth acting on.
+For distribution it also **warns** when a rendition source matches a block
+type for which no schema in the generation declares a `rel:"rendition"` link.
+Delivered documents would then carry rendition links the consumer's copy of
+the schemas rejects — the configuration is accepted, but the warning is worth
+acting on.
 
 ## Changing a schema
 
@@ -156,20 +194,28 @@ serving it. The flow is:
 
 ## Library use
 
-`ReadConfigFromDirectory` parses a configuration directory, and `BuildPlan`
-diffs it against a server's active generation and returns the payload that
-would replace it:
+The service packages parse configuration directories and build plans;
+`BuildPlan` diffs a configuration against a server's active generation and
+returns the payload that would replace it:
 
 ```go
-conf, err := distconf.ReadConfigFromDirectory(dir)
-plan, err := distconf.BuildPlan(ctx, clients, conf, schemas, description)
+import "github.com/ttab/distconf/distribution"
+
+conf, err := distribution.ReadConfigFromDirectory(dir)
+plan, err := distribution.BuildPlan(ctx, clients, conf, schemas, description)
 gen, err := plan.Execute(ctx, clients)
 ```
+
+The `live` package mirrors the same API for the live service.
 
 `WithSchemasDir` loads the schemas named by each `schema_set` from a local
 directory (`{dir}/{name}.json`) instead of fetching them from the configured
 repository, which is useful when developing schemas locally or in tests that
 must not touch the network.
+
+The root `distconf` package holds what is shared between services: the
+`configuration` block, schema set loading and lockfile handling, and the
+schema part of plan building.
 
 ## Development
 
