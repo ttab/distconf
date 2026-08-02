@@ -231,6 +231,156 @@ func TestReadConfigExample(t *testing.T) {
 	if withScript == 0 {
 		t.Error("no document in the example resolved a transform script")
 	}
+
+	var embedded int
+
+	for _, doc := range conf.Documents {
+		if doc.Embeddings {
+			embedded++
+		}
+	}
+
+	if embedded == 0 {
+		t.Error("no document in the example enabled embeddings")
+	}
+
+	var forwardAnchored, backwardAnchored, bounded int
+
+	for _, doc := range conf.Documents {
+		switch doc.Anchor {
+		case distribution.AnchorTimeExpressions:
+			if len(doc.TimeExpressions) > 0 {
+				forwardAnchored++
+			}
+		case distribution.AnchorFirstPublished:
+			backwardAnchored++
+		}
+
+		if doc.BoundedCollection {
+			bounded++
+		}
+	}
+
+	if forwardAnchored == 0 {
+		t.Error("no document in the example is forward-anchored")
+	}
+
+	if backwardAnchored == 0 {
+		t.Error("no document in the example is backward-anchored")
+	}
+
+	if bounded == 0 {
+		t.Error("no document in the example is a bounded collection")
+	}
+}
+
+// TestReadConfigAnchors covers the anchor settings and the two ways the
+// anchor and the time expressions can disagree. Neither of them fails at
+// apply time, which is why they are refused here.
+func TestReadConfigAnchors(t *testing.T) {
+	t.Run("a forward anchor decodes its expressions", func(t *testing.T) {
+		dir := writeConfigDir(t, map[string]string{
+			"doc.hcl": `
+document "core/planning-item" {
+  anchor = "time_expressions"
+
+  time_expression {
+    expression = ".meta(type='core/event').data{start}"
+    layout     = "2006-01-02 15:04"
+    timezone   = "Europe/Stockholm"
+  }
+}
+`,
+		})
+
+		conf, err := distribution.ReadConfigFromDirectory(dir)
+		if err != nil {
+			t.Fatalf("read config: %v", err)
+		}
+
+		doc := conf.Documents[0]
+
+		if doc.Anchor != distribution.AnchorTimeExpressions {
+			t.Errorf("anchor not decoded: %q", doc.Anchor)
+		}
+
+		if len(doc.TimeExpressions) != 1 {
+			t.Fatalf("got %d time expressions, want 1",
+				len(doc.TimeExpressions))
+		}
+
+		if doc.TimeExpressions[0].Layout != "2006-01-02 15:04" {
+			t.Errorf("layout not decoded: %q",
+				doc.TimeExpressions[0].Layout)
+		}
+
+		if doc.TimeExpressions[0].Timezone != "Europe/Stockholm" {
+			t.Errorf("timezone not decoded: %q",
+				doc.TimeExpressions[0].Timezone)
+		}
+	})
+
+	cases := map[string]struct {
+		config  string
+		errPart string
+	}{
+		"forward anchor without expressions": {
+			config: `
+document "core/planning-item" {
+  anchor = "time_expressions"
+}
+`,
+			errPart: "at least one time_expression block",
+		},
+		"expressions without the anchor": {
+			config: `
+document "core/planning-item" {
+  time_expression {
+    expression = ".meta(type='core/planning-item').data{start_date:date}"
+  }
+}
+`,
+			errPart: "nothing reads them",
+		},
+		"expressions under a backward anchor": {
+			config: `
+document "core/article" {
+  anchor = "first_published"
+
+  time_expression {
+    expression = ".meta(type='core/planning-item').data{start_date:date}"
+  }
+}
+`,
+			errPart: "nothing reads them",
+		},
+		"unknown anchor": {
+			config: `
+document "core/article" {
+  anchor = "whenever"
+}
+`,
+			errPart: "unknown anchor",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := writeConfigDir(t, map[string]string{
+				"doc.hcl": tc.config,
+			})
+
+			_, err := distribution.ReadConfigFromDirectory(dir)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+
+			if !strings.Contains(err.Error(), tc.errPart) {
+				t.Errorf("expected an error mentioning %q, got %v",
+					tc.errPart, err)
+			}
+		})
+	}
 }
 
 func TestReadConfigDocumentSettings(t *testing.T) {
@@ -240,6 +390,7 @@ document "core/article" {
   transform_script   = "function transform(doc) { return doc }"
   bounded_collection = true
   variants           = ["web", "print"]
+  embeddings         = true
 }
 `,
 	})
@@ -261,5 +412,9 @@ document "core/article" {
 
 	if len(doc.Variants) != 2 {
 		t.Errorf("variants not decoded: %v", doc.Variants)
+	}
+
+	if !doc.Embeddings {
+		t.Error("embeddings not decoded")
 	}
 }

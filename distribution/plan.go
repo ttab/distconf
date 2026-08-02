@@ -208,6 +208,9 @@ func planTypes(
 				TransformScript:   doc.TransformScript,
 				BoundedCollection: doc.BoundedCollection,
 				Variants:          doc.Variants,
+				Embeddings:        doc.Embeddings,
+				Anchor:            doc.Anchor,
+				TimeExpressions:   timeExpressionsToRPC(doc.TimeExpressions),
 			},
 		}
 
@@ -574,7 +577,84 @@ func typeSettingsDiff(
 			"variants: %v => %v", curr.Variants, doc.Variants))
 	}
 
+	if curr.Embeddings != doc.Embeddings {
+		lines = append(lines, fmt.Sprintf(
+			"embeddings: %t => %t", curr.Embeddings, doc.Embeddings))
+	}
+
+	if curr.Anchor != doc.Anchor {
+		lines = append(lines, fmt.Sprintf(
+			"anchor: %s => %s",
+			anchorName(curr.Anchor), anchorName(doc.Anchor)))
+	}
+
+	wanted := timeExpressionsToRPC(doc.TimeExpressions)
+
+	if !timeExpressionsEqual(curr.TimeExpressions, wanted) {
+		lines = append(lines, fmt.Sprintf(
+			"time_expressions: %s => %s",
+			timeExpressionSummary(curr.TimeExpressions),
+			timeExpressionSummary(wanted)))
+	}
+
 	return strings.Join(lines, "\n")
+}
+
+// timeExpressionsToRPC converts the configured time expressions into the
+// API representation.
+func timeExpressionsToRPC(
+	expressions []TimeExpressionConfig,
+) []*dist.TypeTimeExpression {
+	if len(expressions) == 0 {
+		return nil
+	}
+
+	out := make([]*dist.TypeTimeExpression, len(expressions))
+
+	for i, e := range expressions {
+		out[i] = &dist.TypeTimeExpression{
+			Expression: e.Expression,
+			Layout:     e.Layout,
+			Timezone:   e.Timezone,
+		}
+	}
+
+	return out
+}
+
+// timeExpressionsEqual compares two sets of time expressions. Order is
+// part of the value: the extractor merges the spans it gets, but the
+// stored configuration is a list and is replaced whole.
+func timeExpressionsEqual(a, b []*dist.TypeTimeExpression) bool {
+	return slices.EqualFunc(a, b,
+		func(x, y *dist.TypeTimeExpression) bool {
+			return x.GetExpression() == y.GetExpression() &&
+				x.GetLayout() == y.GetLayout() &&
+				x.GetTimezone() == y.GetTimezone()
+		})
+}
+
+// timeExpressionSummary renders time expressions for a plan line.
+func timeExpressionSummary(expressions []*dist.TypeTimeExpression) string {
+	if len(expressions) == 0 {
+		return "none"
+	}
+
+	parts := make([]string, len(expressions))
+
+	for i, e := range expressions {
+		parts[i] = e.GetExpression()
+
+		if e.GetLayout() != "" {
+			parts[i] += " layout=" + e.GetLayout()
+		}
+
+		if e.GetTimezone() != "" {
+			parts[i] += " tz=" + e.GetTimezone()
+		}
+	}
+
+	return strings.Join(parts, ", ")
 }
 
 type typePlanChange struct {

@@ -60,16 +60,60 @@ schema_set "public" {
 
 * **`document`** blocks describe per-type configuration: a transform script
   (either inline via `transform_script` or from a file via `transform_file` —
-  the two are mutually exclusive), plus the type's `bounded_collection` and
-  `variants` settings.
+  the two are mutually exclusive), plus the type's `bounded_collection`,
+  `variants`, `embeddings` and `anchor` settings.
 
   ```hcl
   document "core/article" {
     transform_file = "article.ts"
+    embeddings     = true
   }
 
   document "core/section" {}
   ```
+
+  `embeddings` turns on semantic indexing for the type: its documents are
+  chunked and embedded, and it can be searched and subscribed to by vector.
+  It needs a deployment with an embedding sidecar, and it only takes effect
+  for indexes created after it is applied — the vector field cannot be added
+  to an index that already exists, so switching it on for a type that is
+  already indexed takes a new index generation.
+
+  `anchor` decides how the type is partitioned across the search indexes,
+  and nothing else — it is independent of `embeddings`. Leave it out for a
+  non-temporal type (one unpartitioned index per language, never archived);
+  `first_published` partitions news content by when it was first
+  distributed, which is immutable, so a document never moves between
+  partitions; `time_expressions` partitions by dates read out of the
+  document itself, for content that is *about* a date rather than published
+  on one, and everything from the current quarter onwards shares one index.
+
+  ```hcl
+  document "core/planning-item" {
+    anchor = "time_expressions"
+
+    time_expression {
+      expression = ".meta(type='core/planning-item').data{start_date:date}"
+    }
+  }
+  ```
+
+  `time_expression` blocks are newsdoc value-extractor expressions, with an
+  optional `layout` and `timezone`. The `time_expressions` anchor requires at
+  least one and every other anchor refuses them, because both mismatches are
+  otherwise silent: a forward-anchored type with no expressions falls back to
+  anchoring on first-published, and expressions under any other anchor are
+  read by nothing.
+
+  **Set `timezone` only for wall-clock timestamps that carry no offset**, the
+  `"2006-01-02 15:04"` kind of value. Leave it off for a date-only value:
+  partitions are cut in UTC, so reading a bare date as UTC keeps it on the
+  day it says, while reading it in a zone east of UTC moves it back a day —
+  and on a quarter boundary, back a whole quarter.
+
+  Like `embeddings`, `anchor` only shapes indexes that don't exist yet, so
+  changing it for a type that is already indexed takes a new index
+  generation.
 
 * **`renditions`** blocks — one per asset kind — declare the delivery-time
   rendition configuration: `default_variants`, `default_extension`, and
