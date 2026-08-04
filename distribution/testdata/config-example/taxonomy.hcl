@@ -15,10 +15,6 @@ document "core/section" {
   bounded_collection = true
 }
 
-document "core/person" {
-  bounded_collection = true
-}
-
 document "core/organisation" {
   bounded_collection = true
 }
