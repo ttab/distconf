@@ -292,7 +292,7 @@ func planRenditions(
 				"render %q rendition spec: %w", rc.Kind, err)
 		}
 
-		warnings := renditionSchemaWarnings(rc, renditionTypes)
+		warnings := renditionSchemaWarnings(entry, renditionTypes)
 
 		curr, ok := active[rc.Kind]
 		if !ok {
@@ -337,6 +337,33 @@ func planRenditions(
 	return desired, changes, nil
 }
 
+// Built-in per-kind defaults for rendition sources. These mirror the
+// defaults the distribution service applies when it compiles a rendition
+// configuration at registration: it stores the compiled configuration, so
+// a source that leaves block types or link rel out comes back from the
+// server with them filled in. We resolve them here, before the payload is
+// built and diffed, so that what we send is what the server stores.
+// Otherwise the defaulting shows up as a diff that no number of applies
+// can settle.
+const (
+	renditionKindImage = "image"
+	imageBlockType     = "core/image"
+	imageLinkRel       = "image"
+)
+
+// renditionKindDefaults returns the built-in default block types and link
+// rel for an asset kind. Kinds without built-in defaults must declare both
+// explicitly in every source; the server rejects the registration if they
+// don't.
+func renditionKindDefaults(kind string) ([]string, string) {
+	switch kind {
+	case renditionKindImage:
+		return []string{imageBlockType}, imageLinkRel
+	default:
+		return nil, ""
+	}
+}
+
 func renditionConfigToRPC(rc RenditionsConfig) *dist.RenditionConfiguration {
 	entry := dist.RenditionConfiguration{
 		Kind:             rc.Kind,
@@ -346,12 +373,24 @@ func renditionConfigToRPC(rc RenditionsConfig) *dist.RenditionConfiguration {
 			[]*dist.RenditionSource, len(rc.Sources)),
 	}
 
+	defBlocks, defRel := renditionKindDefaults(rc.Kind)
+
 	for i, src := range rc.Sources {
+		blockTypes := src.BlockTypes
+		if len(blockTypes) == 0 {
+			blockTypes = defBlocks
+		}
+
+		linkRel := src.LinkRel
+		if linkRel == "" {
+			linkRel = defRel
+		}
+
 		entry.Sources[i] = &dist.RenditionSource{
 			Name:       src.Name,
 			Namespace:  src.Namespace,
-			BlockTypes: src.BlockTypes,
-			LinkRel:    src.LinkRel,
+			BlockTypes: blockTypes,
+			LinkRel:    linkRel,
 			LinkTypes:  src.LinkTypes,
 			UriPattern: src.URIPattern,
 		}
@@ -411,17 +450,12 @@ func renditionSpecJSON(rc *dist.RenditionConfiguration) (string, error) {
 // renditionSchemaWarnings warns about sources whose block types have no
 // rel "rendition" link declared by any desired schema.
 func renditionSchemaWarnings(
-	rc RenditionsConfig, renditionTypes map[string]bool,
+	rc *dist.RenditionConfiguration, renditionTypes map[string]bool,
 ) []string {
 	var warnings []string
 
 	for _, src := range rc.Sources {
-		blockTypes := src.BlockTypes
-		if len(blockTypes) == 0 && rc.Kind == "image" {
-			blockTypes = []string{"core/image"}
-		}
-
-		for _, bt := range blockTypes {
+		for _, bt := range src.BlockTypes {
 			if renditionTypes[bt] {
 				continue
 			}

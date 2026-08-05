@@ -12,4 +12,6 @@ document "core/planning-item" {
     # a quarter boundary, back a whole quarter.
     expression = ".meta(type='core/planning-item').data{start_date:date}"
   }
+
+  embeddings = true
 }

@@ -16,4 +16,6 @@ document "core/event" {
     # where its instant falls in UTC.
     expression = ".meta(type='core/event').data{start}"
   }
+
+  embeddings = true
 }
