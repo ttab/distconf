@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -83,6 +84,18 @@ func main() {
 			&cli.StringFlag{
 				Name:  "description",
 				Usage: "Human-readable label for the new generation",
+			},
+			&cli.BoolFlag{
+				Name:    "yes",
+				Aliases: []string{"y"},
+				Usage: "apply without asking for confirmation, " +
+					"for scripts and CI",
+			},
+			&cli.BoolFlag{
+				Name: "json",
+				Usage: "print the outcome as JSON on the last " +
+					"line, so a caller can tell an applied " +
+					"generation from one that had nothing to do",
 			},
 		}, authFlags...),
 	}
@@ -252,16 +265,21 @@ func applyAction(ctx context.Context, c *cli.Command) error {
 			return fmt.Errorf("build plan: %w", err)
 		}
 
-		return executePlan(plan.Changes, plan.CurrentGenerationID,
-			func() (string, error) {
+		return executePlan(c, plan.Changes, plan.CurrentGenerationID,
+			func() (applyResult, error) {
 				gen, err := plan.Execute(ctx, clients)
 				if err != nil {
-					return "", err
+					return applyResult{}, err
 				}
 
-				return fmt.Sprintf(
-					"Activated generation %d (%d schemas, %d type configurations)",
-					gen.Id, len(gen.Schemas), len(gen.Types)), nil
+				return applyResult{
+					GenerationID: gen.Id,
+					Schemas:      len(gen.Schemas),
+					Types:        len(gen.Types),
+					Summary: fmt.Sprintf(
+						"Activated generation %d (%d schemas, %d type configurations)",
+						gen.Id, len(gen.Schemas), len(gen.Types)),
+				}, nil
 			})
 	case conf.Live != nil:
 		clients, err := getLiveClients(ctx, c)
@@ -275,29 +293,57 @@ func applyAction(ctx context.Context, c *cli.Command) error {
 			return fmt.Errorf("build plan: %w", err)
 		}
 
-		return executePlan(plan.Changes, plan.CurrentGenerationID,
-			func() (string, error) {
+		return executePlan(c, plan.Changes, plan.CurrentGenerationID,
+			func() (applyResult, error) {
 				gen, err := plan.Execute(ctx, clients)
 				if err != nil {
-					return "", err
+					return applyResult{}, err
 				}
 
-				return fmt.Sprintf(
-					"Activated generation %d (%d schemas, %d post types)",
-					gen.Id, len(gen.Schemas), len(gen.PostTypes)), nil
+				return applyResult{
+					GenerationID: gen.Id,
+					Schemas:      len(gen.Schemas),
+					Types:        len(gen.PostTypes),
+					Summary: fmt.Sprintf(
+						"Activated generation %d (%d schemas, %d post types)",
+						gen.Id, len(gen.Schemas), len(gen.PostTypes)),
+				}, nil
 			})
 	}
 
 	return errors.New("no service configuration loaded")
 }
 
+// applyResult is what an apply did, in a form a caller can assert on
+// instead of reading the summary line. It is what --json prints.
+//
+// Activated is the distinction prose could not carry: an apply that had
+// nothing to do and one that registered a generation both succeed and both
+// print something reassuring, so a script had to parse the wording or go
+// and ask the database. Counts are of the generation as the server returned
+// it, not of the configuration that was sent, so they answer "what is
+// active now".
+type applyResult struct {
+	Activated    bool   `json:"activated"`
+	GenerationID int64  `json:"generation_id"`
+	Schemas      int    `json:"schemas"`
+	Types        int    `json:"types"`
+	Changes      int    `json:"changes"`
+	Summary      string `json:"summary"`
+}
+
 // executePlan prints the plan diff and current state, asks for
-// confirmation if the plan would change anything, and runs execute. The
-// summary returned by execute is printed on success.
+// confirmation if the plan would change anything, and runs execute.
+//
+// Confirmation is skipped by --yes. Without it a non-interactive caller has
+// to pipe an answer in, which forces a pipeline and takes the exit status
+// with it - the failure mode being a script that reads the status of the
+// thing it piped into rather than of distconf.
 func executePlan(
+	c *cli.Command,
 	changes []distconf.ConfigurationChange,
 	currentGenerationID int64,
-	execute func() (string, error),
+	execute func() (applyResult, error),
 ) error {
 	printChanges(changes)
 
@@ -314,21 +360,43 @@ func executePlan(
 	if len(changes) == 0 && currentGenerationID != 0 {
 		fmt.Fprintln(os.Stdout, "No changes needed")
 
-		return nil
+		return reportApply(c, applyResult{
+			GenerationID: currentGenerationID,
+			Summary:      "No changes needed",
+		})
 	}
 
-	if !askForConfirmation(
+	if !c.Bool("yes") && !askForConfirmation(
 		"Register a new generation and activate it?") {
 		return errors.New("aborted by user")
 	}
 
-	summary, err := execute()
+	result, err := execute()
 	if err != nil {
 		return fmt.Errorf("apply generation: %w", err)
 	}
 
+	result.Activated = true
+	result.Changes = len(changes)
+
 	fmt.Fprintln(os.Stdout)
-	fmt.Fprintln(os.Stdout, summary)
+	fmt.Fprintln(os.Stdout, result.Summary)
+
+	return reportApply(c, result)
+}
+
+// reportApply prints the machine-readable result when --json was asked for.
+func reportApply(c *cli.Command, result applyResult) error {
+	if !c.Bool("json") {
+		return nil
+	}
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal the apply result: %w", err)
+	}
+
+	fmt.Fprintf(os.Stdout, "%s\n", data)
 
 	return nil
 }
