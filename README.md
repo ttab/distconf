@@ -205,6 +205,28 @@ such a directory.
   desired state, the state the worker reports, its position in the repository
   eventlog, and whether it has caught up.
 
+* **`distconf distribution generation list|create|wait|activate|delete`** —
+  manages the distribution service's *index* generations: one complete set of
+  search indexes, under one prefix, on one cluster, with an eventlog cursor of
+  its own. This is how the index is rebuilt from scratch after a mapping
+  change that cannot be applied in place, how an OpenSearch upgrade is done,
+  and how a lost cluster is recovered from.
+
+  `list` is the catch-up view — every generation with the eventlog position
+  its indexer has reached, its lag, and the head of the log — and takes
+  `--json`. `create` registers a generation and starts building it in the
+  background while the active one keeps serving; it is additive and changes
+  nothing about what is being delivered. `wait` polls until the generation is
+  within `--max-lag` (10, matching the service's activation gate) of the head.
+  `activate` switches search, calibration and subscription matching over, and
+  prints the position subscription matching was handed over at. `delete`
+  removes an inactive generation, its indexes and its snapshots.
+
+  A generation reports position 0 and full lag while it drains the archive,
+  which is the first phase of every rebuild and can take a long time. That is
+  not a stall — the indexer stores no position until it starts tailing the
+  log.
+
 * **`distconf version`** — prints the binary version.
 
 ## How `apply` works

@@ -22,6 +22,13 @@ import (
 
 const appName = "distconf"
 
+// Flag and argument names shared between commands.
+const (
+	flagYes      = "yes"
+	flagJSON     = "json"
+	argUsageName = "<name>"
+)
+
 var version = "dev"
 
 func main() {
@@ -86,13 +93,13 @@ func main() {
 				Usage: "Human-readable label for the new generation",
 			},
 			&cli.BoolFlag{
-				Name:    "yes",
+				Name:    flagYes,
 				Aliases: []string{"y"},
 				Usage: "apply without asking for confirmation, " +
 					"for scripts and CI",
 			},
 			&cli.BoolFlag{
-				Name: "json",
+				Name: flagJSON,
 				Usage: "print the outcome as JSON on the last " +
 					"line, so a caller can tell an applied " +
 					"generation from one that had nothing to do",
@@ -105,6 +112,7 @@ func main() {
 		Description: "Commands specific to the distribution service",
 		Commands: []*cli.Command{
 			syncCommand(authFlags),
+			generationCommand(authFlags),
 		},
 	}
 
@@ -366,7 +374,7 @@ func executePlan(
 		})
 	}
 
-	if !c.Bool("yes") && !askForConfirmation(
+	if !c.Bool(flagYes) && !askForConfirmation(
 		"Register a new generation and activate it?") {
 		return errors.New("aborted by user")
 	}
@@ -387,7 +395,7 @@ func executePlan(
 
 // reportApply prints the machine-readable result when --json was asked for.
 func reportApply(c *cli.Command, result applyResult) error {
-	if !c.Bool("json") {
+	if !c.Bool(flagJSON) {
 		return nil
 	}
 
