@@ -211,6 +211,7 @@ func planTypes(
 				Embeddings:        doc.Embeddings,
 				Anchor:            doc.Anchor,
 				TimeExpressions:   timeExpressionsToRPC(doc.TimeExpressions),
+				FacetExpressions:  facetsToRPC(doc.Facets),
 			},
 		}
 
@@ -631,7 +632,61 @@ func typeSettingsDiff(
 			timeExpressionSummary(wanted)))
 	}
 
+	wantedFacets := facetsToRPC(doc.Facets)
+
+	if !facetsEqual(curr.FacetExpressions, wantedFacets) {
+		lines = append(lines, fmt.Sprintf(
+			"facets: %s => %s",
+			facetSummary(curr.FacetExpressions),
+			facetSummary(wantedFacets)))
+	}
+
 	return strings.Join(lines, "\n")
+}
+
+// facetsToRPC converts the configured facet expressions into the API
+// representation.
+func facetsToRPC(facets []FacetConfig) []*dist.TypeFacetExpression {
+	if len(facets) == 0 {
+		return nil
+	}
+
+	out := make([]*dist.TypeFacetExpression, len(facets))
+
+	for i, f := range facets {
+		out[i] = &dist.TypeFacetExpression{
+			Name:       f.Name,
+			Expression: f.Expression,
+		}
+	}
+
+	return out
+}
+
+// facetsEqual compares two sets of facet expressions. Order is part of
+// the value, as it is for time expressions: the stored configuration is a
+// list and is replaced whole.
+func facetsEqual(a, b []*dist.TypeFacetExpression) bool {
+	return slices.EqualFunc(a, b,
+		func(x, y *dist.TypeFacetExpression) bool {
+			return x.GetName() == y.GetName() &&
+				x.GetExpression() == y.GetExpression()
+		})
+}
+
+// facetSummary renders facet expressions for a plan line.
+func facetSummary(facets []*dist.TypeFacetExpression) string {
+	if len(facets) == 0 {
+		return "none"
+	}
+
+	parts := make([]string, len(facets))
+
+	for i, f := range facets {
+		parts[i] = f.GetName() + "=" + f.GetExpression()
+	}
+
+	return strings.Join(parts, ", ")
 }
 
 // timeExpressionsToRPC converts the configured time expressions into the

@@ -14,4 +14,11 @@ document "core/planning-item" {
   }
 
   embeddings = true
+
+  # The section a planning item belongs to, so that the calendar can be
+  # narrowed the same way the published day is. Same value as an article's:
+  # the section document's UUID.
+  facet "section" {
+    expression = ".links(rel='section')@{uuid}"
+  }
 }

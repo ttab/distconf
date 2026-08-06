@@ -75,6 +75,30 @@ type DocumentConfig struct {
 	// switching it on for a type that is already indexed takes a new
 	// index generation.
 	Embeddings bool `hcl:"embeddings,optional"`
+
+	// Facets extract the values the daily views of
+	// Content.ListPublishedVersions and Content.ListPlannedVersions can
+	// narrow on. They are evaluated when a version is stored, so a facet
+	// only narrows what was published after it was applied - adding one
+	// to a type that already has content means backfilling the rest.
+	Facets []FacetConfig `hcl:"facet,block"`
+}
+
+// FacetConfig extracts one facet's values from a document. The label is
+// the facet name a request narrows by, and several blocks may share it -
+// their values are unioned.
+//
+// The expression should yield document UUIDs rather than labels: a facet
+// filter matches exactly, with no analysis or case folding, so
+// "section = sport" matches nothing at all. A section is a core/section
+// document, and the client resolves display names itself.
+//
+// Extraction is configuration rather than code because a facet is not in
+// the same place in every type - a flash, an article and a planning item
+// all reference their section differently.
+type FacetConfig struct {
+	Name       string `hcl:"name,label"`
+	Expression string `hcl:"expression"`
 }
 
 // TimeExpressionConfig extracts a date or a timespan from a document. It
@@ -249,6 +273,14 @@ func validateDocuments(docs []DocumentConfig) error {
 				return fmt.Errorf(
 					"document %q: time_expression %d has no expression",
 					doc.Type, i)
+			}
+		}
+
+		for _, f := range doc.Facets {
+			if f.Expression == "" {
+				return fmt.Errorf(
+					"document %q: facet %q has no expression",
+					doc.Type, f.Name)
 			}
 		}
 	}

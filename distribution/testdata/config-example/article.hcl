@@ -12,4 +12,16 @@ document "core/article" {
   # with an embedding sidecar, and only applies to indexes created after
   # it is applied.
   embeddings = true
+
+  # The section the article was published in, so that a published-day view
+  # can be narrowed to it. Extracted per version and stored with it, so a
+  # version that was in Sport when it was published stays in Sport's day
+  # even after a later version moves out - which is what a publication log
+  # should say.
+  #
+  # The value is the section document's UUID rather than its name: a facet
+  # filter matches exactly, and the client resolves display names itself.
+  facet "section" {
+    expression = ".links(rel='section')@{uuid}"
+  }
 }

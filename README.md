@@ -115,6 +115,34 @@ schema_set "public" {
   changing it for a type that is already indexed takes a new index
   generation.
 
+  `facet` blocks declare the values the daily views —
+  `Content.ListPublishedVersions` and `Content.ListPlannedVersions` — can
+  narrow on. The label is the facet name a request filters by, the
+  expression is a newsdoc value extractor, and several blocks may share a
+  name so their values are unioned.
+
+  ```hcl
+  document "core/article" {
+    facet "section" {
+      expression = ".links(rel='section')@{uuid}"
+    }
+  }
+  ```
+
+  Facets are extracted **when a version is stored**, not at query time, so
+  two things follow. A facet only narrows content published after it was
+  applied — adding one to a type that already has content means backfilling
+  the rest. And the narrowing is per version: an article that was in Sport
+  at 08:00 and moved out in v3 is still in Sport's published day at 08:00,
+  which is what a publication log should say.
+
+  **The values should be document UUIDs, not labels.** A facet filter
+  matches exactly, with no analysis or case folding, so `section = "sport"`
+  matches nothing at all. A section is a `core/section` document; the
+  client filters by the UUIDs it already holds and resolves display names
+  itself. An expression is needed per type because a section is not in the
+  same place in every one of them.
+
 * **`renditions`** blocks — one per asset kind — declare the delivery-time
   rendition configuration: `default_variants`, `default_extension`, and
   ordered `source` blocks that match asset references by block type, link rel
