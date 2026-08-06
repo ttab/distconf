@@ -1,24 +1,24 @@
 {
-  "updated": "2026-08-04T16:23:28.427593486+02:00",
+  "updated": "2026-08-06T11:19:48.809379164+02:00",
   "schemas": {
     "se.ecms.dist": {
       "name": "se.ecms.dist",
-      "version": "v0.0.12",
-      "hash": "cb92e0c8d94e2387d838784f899f15fa5309b0875b7bb18709b5353d4240210e"
+      "version": "v0.0.13",
+      "hash": "13ced6db9634528f204b4512550a740b5b2247adae48437d35ac0f8b5128559e"
     },
     "se.ecms.dist.planning": {
       "name": "se.ecms.dist.planning",
-      "version": "v0.0.12",
+      "version": "v0.0.13",
       "hash": "f545c4e1d01584ea8d6e71b5b773a3f058b126af46f7355a45b478a27382da7f"
     },
     "se.tt.dist": {
       "name": "se.tt.dist",
-      "version": "v0.0.12",
+      "version": "v0.0.13",
       "hash": "d8504f7f718b4d15b3963f93718e4b6d10b699e00787cc1ef928218a35d25712"
     },
     "se.tt.dist.planning": {
       "name": "se.tt.dist.planning",
-      "version": "v0.0.12",
+      "version": "v0.0.13",
       "hash": "24658e6e74ef2bb11f4b509869dca954350eb8c0b7253fa09c52723b373bfe58"
     }
   }
