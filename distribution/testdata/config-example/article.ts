@@ -110,22 +110,5 @@ function transform(doc: Document): Document {
 		doc.title = html.decode(html.strip(nd.get_data(heading, "text")))
 	}
 
-	doc.content = nd.alter_blocks(
-		doc.content,
-		(b: Block) => b.type === "core/text",
-		(b: Block) => {
-			const text = nd.get_data(b, "text", "")
-			if (text === "") {
-				return b
-			}
-
-			b.data = nd.upsert_data(b.data, {
-				text: text.replaceAll("straff", "belöning"),
-			})
-
-			return b
-		},
-	)
-
 	return doc
 }
