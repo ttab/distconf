@@ -272,6 +272,69 @@ func TestReadConfigExample(t *testing.T) {
 	if bounded == 0 {
 		t.Error("no document in the example is a bounded collection")
 	}
+
+	// The example is what operators crib from, so the delivery fields it
+	// declares are checked by name and kind. "place" is on planning items
+	// only, because only a planning item carries the link - it is the
+	// partially-declared field an editor has to warn about, and it is one
+	// because of what the types are, not because the example withheld a
+	// declaration.
+	wantDelivery := map[string]map[string]string{
+		"core/article": {
+			"section":   distribution.KindKeyword,
+			"newsvalue": distribution.KindNumber,
+			"headline":  distribution.KindText,
+		},
+		"core/planning-item": {
+			"section":   distribution.KindKeyword,
+			"newsvalue": distribution.KindNumber,
+			"headline":  distribution.KindText,
+			"place":     distribution.KindKeyword,
+		},
+	}
+
+	for _, doc := range conf.Documents {
+		want, ok := wantDelivery[doc.Type]
+		if !ok {
+			continue
+		}
+
+		delete(wantDelivery, doc.Type)
+
+		if len(doc.DeliveryFields) != len(want) {
+			t.Errorf("document %q has %d delivery fields, want %d",
+				doc.Type, len(doc.DeliveryFields), len(want))
+		}
+
+		for _, f := range doc.DeliveryFields {
+			kind, ok := want[f.Name]
+			if !ok {
+				t.Errorf("document %q declares the unexpected delivery field %q",
+					doc.Type, f.Name)
+
+				continue
+			}
+
+			if f.Kind != kind {
+				t.Errorf("document %q declares %q as %q, want %q",
+					doc.Type, f.Name, f.Kind, kind)
+			}
+
+			if f.Expression == "" {
+				t.Errorf("document %q declares %q with no expression",
+					doc.Type, f.Name)
+			}
+
+			if f.Description == "" {
+				t.Errorf("document %q declares %q with no description",
+					doc.Type, f.Name)
+			}
+		}
+	}
+
+	for docType := range wantDelivery {
+		t.Errorf("the example has no %q document", docType)
+	}
 }
 
 // TestReadConfigAnchors covers the anchor settings and the two ways the
@@ -391,6 +454,12 @@ document "core/article" {
   bounded_collection = true
   variants           = ["web", "print"]
   embeddings         = true
+
+  delivery_field "section" {
+    kind        = "keyword"
+    expression  = ".links(rel='section')@{uuid}"
+    description = "The section the content was published in."
+  }
 }
 `,
 	})
@@ -416,5 +485,140 @@ document "core/article" {
 
 	if !doc.Embeddings {
 		t.Error("embeddings not decoded")
+	}
+
+	if len(doc.DeliveryFields) != 1 {
+		t.Fatalf("got %d delivery fields, want 1", len(doc.DeliveryFields))
+	}
+
+	df := doc.DeliveryFields[0]
+
+	if df.Name != "section" {
+		t.Errorf("delivery field name not decoded: %q", df.Name)
+	}
+
+	if df.Kind != distribution.KindKeyword {
+		t.Errorf("delivery field kind not decoded: %q", df.Kind)
+	}
+
+	if df.Expression != ".links(rel='section')@{uuid}" {
+		t.Errorf("delivery field expression not decoded: %q", df.Expression)
+	}
+
+	// The description is what an editor shows beside the field name, so a
+	// silently dropped one is a field nobody can tell apart from the next.
+	if df.Description != "The section the content was published in." {
+		t.Errorf("delivery field description not decoded: %q",
+			df.Description)
+	}
+}
+
+// TestReadConfigDeliveryFieldKinds covers the delivery field declarations
+// that decode cleanly and mean nothing. Neither of them fails at apply
+// time in a way an operator sees, which is why they are refused here.
+func TestReadConfigDeliveryFieldKinds(t *testing.T) {
+	cases := map[string]struct {
+		config  string
+		errPart string
+	}{
+		// kind is a required attribute rather than an optional one, so
+		// omitting it entirely is HCL's error rather than ours. Both
+		// are covered: the kind has no usable default, and a
+		// declaration that forgot it must not be read as a keyword.
+		"no kind at all": {
+			config: `
+document "core/article" {
+  delivery_field "section" {
+    expression = ".links(rel='section')@{uuid}"
+  }
+}
+`,
+			errPart: `The argument "kind" is required`,
+		},
+		"an empty kind": {
+			config: `
+document "core/article" {
+  delivery_field "section" {
+    kind       = ""
+    expression = ".links(rel='section')@{uuid}"
+  }
+}
+`,
+			errPart: "unknown kind",
+		},
+		"a misspelled kind": {
+			config: `
+document "core/article" {
+  delivery_field "section" {
+    kind       = "keywrod"
+    expression = ".links(rel='section')@{uuid}"
+  }
+}
+`,
+			errPart: "unknown kind",
+		},
+		"no expression": {
+			config: `
+document "core/article" {
+  delivery_field "section" {
+    kind       = "keyword"
+    expression = ""
+  }
+}
+`,
+			errPart: "has no expression",
+		},
+		"one name, two kinds": {
+			config: `
+document "core/article" {
+  delivery_field "section" {
+    kind       = "keyword"
+    expression = ".links(rel='section')@{uuid}"
+  }
+
+  delivery_field "section" {
+    kind       = "text"
+    expression = ".links(rel='section')@{title}"
+  }
+}
+`,
+			errPart: "declared as both",
+		},
+		"one name, two descriptions": {
+			config: `
+document "core/article" {
+  delivery_field "section" {
+    kind        = "keyword"
+    expression  = ".links(rel='section')@{uuid}"
+    description = "The section."
+  }
+
+  delivery_field "section" {
+    kind        = "keyword"
+    expression  = ".links(rel='subsection')@{uuid}"
+    description = "The subsection."
+  }
+}
+`,
+			errPart: "two different descriptions",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := writeConfigDir(t, map[string]string{
+				"doc.hcl": tc.config,
+			})
+
+			_, err := distribution.ReadConfigFromDirectory(dir)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+
+			if !strings.Contains(err.Error(), tc.errPart) {
+				t.Errorf("expected an error mentioning %q, got %v",
+					tc.errPart, err)
+			}
+		})
 	}
 }

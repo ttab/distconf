@@ -212,6 +212,7 @@ func planTypes(
 				Anchor:            doc.Anchor,
 				TimeExpressions:   timeExpressionsToRPC(doc.TimeExpressions),
 				FacetExpressions:  facetsToRPC(doc.Facets),
+				DeliveryFields:    deliveryFieldsToRPC(doc.DeliveryFields),
 			},
 		}
 
@@ -594,6 +595,10 @@ func (c *renditionPlanChange) Warnings() []string {
 	return c.warnings
 }
 
+// summaryNone is how an empty list of blocks reads on a plan line, on
+// both sides of the arrow.
+const summaryNone = "none"
+
 // typeSettingsDiff describes changes to the non-script type settings,
 // or returns an empty string when they are unchanged.
 func typeSettingsDiff(
@@ -641,7 +646,95 @@ func typeSettingsDiff(
 			facetSummary(wantedFacets)))
 	}
 
+	wantedDelivery := deliveryFieldsToRPC(doc.DeliveryFields)
+
+	if !deliveryFieldsEqual(curr.DeliveryFields, wantedDelivery) {
+		lines = append(lines, fmt.Sprintf(
+			"delivery_fields: %s => %s",
+			deliveryFieldSummary(curr.DeliveryFields),
+			deliveryFieldSummary(wantedDelivery)))
+	}
+
 	return strings.Join(lines, "\n")
+}
+
+// deliveryFieldsToRPC converts the configured delivery fields into the
+// API representation. Nil for an empty set, so that a type without them
+// round-trips to what it started as - an empty slice would make the
+// server see a diff and register a generation on every apply.
+//
+// Sorted by name, and that is not cosmetic. A name is one field per type
+// (the server refuses a duplicate), so the list is a set: reordering two
+// delivery_field blocks in the HCL means nothing, and without a canonical
+// order it would still print a diff line and register a whole new
+// configuration generation on apply - the outcome "activated:false,
+// changes:0" exists to make visible and avoid. Facets are deliberately not
+// changed to match: several facet blocks may share a name and their values
+// are unioned, so their order is arguably information. This one is not.
+func deliveryFieldsToRPC(
+	fields []DeliveryFieldConfig,
+) []*dist.TypeDeliveryField {
+	if len(fields) == 0 {
+		return nil
+	}
+
+	out := make([]*dist.TypeDeliveryField, len(fields))
+
+	for i, f := range fields {
+		out[i] = &dist.TypeDeliveryField{
+			Name:        f.Name,
+			Kind:        f.Kind,
+			Expression:  f.Expression,
+			Description: f.Description,
+		}
+	}
+
+	slices.SortFunc(out, func(x, y *dist.TypeDeliveryField) int {
+		return strings.Compare(x.GetName(), y.GetName())
+	})
+
+	return out
+}
+
+// deliveryFieldsEqual compares two sets. Both sides come out of
+// deliveryFieldsToRPC or out of the server, which stores what that sent,
+// so both are already name-sorted and a positional comparison is a set
+// comparison. Sorting a defensive copy of the current side first costs
+// nothing and makes that independent of the server having preserved order.
+func deliveryFieldsEqual(a, b []*dist.TypeDeliveryField) bool {
+	as := slices.Clone(a)
+	bs := slices.Clone(b)
+
+	byName := func(x, y *dist.TypeDeliveryField) int {
+		return strings.Compare(x.GetName(), y.GetName())
+	}
+
+	slices.SortFunc(as, byName)
+	slices.SortFunc(bs, byName)
+
+	return slices.EqualFunc(as, bs,
+		func(x, y *dist.TypeDeliveryField) bool {
+			return x.GetName() == y.GetName() &&
+				x.GetKind() == y.GetKind() &&
+				x.GetExpression() == y.GetExpression() &&
+				x.GetDescription() == y.GetDescription()
+		})
+}
+
+// deliveryFieldSummary renders delivery fields for a plan line.
+func deliveryFieldSummary(fields []*dist.TypeDeliveryField) string {
+	if len(fields) == 0 {
+		return summaryNone
+	}
+
+	parts := make([]string, len(fields))
+
+	for i, f := range fields {
+		parts[i] = f.GetName() + ":" + f.GetKind() +
+			"=" + f.GetExpression()
+	}
+
+	return strings.Join(parts, ", ")
 }
 
 // facetsToRPC converts the configured facet expressions into the API
@@ -677,7 +770,7 @@ func facetsEqual(a, b []*dist.TypeFacetExpression) bool {
 // facetSummary renders facet expressions for a plan line.
 func facetSummary(facets []*dist.TypeFacetExpression) string {
 	if len(facets) == 0 {
-		return "none"
+		return summaryNone
 	}
 
 	parts := make([]string, len(facets))
@@ -726,7 +819,7 @@ func timeExpressionsEqual(a, b []*dist.TypeTimeExpression) bool {
 // timeExpressionSummary renders time expressions for a plan line.
 func timeExpressionSummary(expressions []*dist.TypeTimeExpression) string {
 	if len(expressions) == 0 {
-		return "none"
+		return summaryNone
 	}
 
 	parts := make([]string, len(expressions))

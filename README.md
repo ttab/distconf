@@ -143,6 +143,49 @@ schema_set "public" {
   itself. An expression is needed per type because a section is not in the
   same place in every one of them.
 
+  `delivery_field` blocks declare the type's contribution to the
+  deployment's delivery-field vocabulary: the names a delivery rule may
+  reference, and how each one is read out of a document of this type. The
+  label is the name, `kind` is one of `keyword`, `number`, `text` or `geo`,
+  `expression` is a newsdoc value extractor, and `description` is the text
+  an editor shows beside the name.
+
+  ```hcl
+  document "core/article" {
+    delivery_field "section" {
+      kind        = "keyword"
+      expression  = ".links(rel='section')@{uuid}"
+      description = "The section the content was published in."
+    }
+  }
+  ```
+
+  **A name means one field deployment-wide.** Several types declare it,
+  each with the expression that finds it there, because a section is not in
+  the same place in an article and in a planning item — but the kind and
+  the description have to agree, or the name means two things and a rule
+  written against one of them silently under-delivers against the other.
+  The service refuses the disagreement when the generation is registered;
+  distconf catches the kind and a type contradicting itself.
+
+  **A field only some of a subscription's types declare is a no-match on
+  the rest**, silently, because an absent key is a no-match by definition.
+  That is a property of what the types carry rather than a mistake — only a
+  planning item has a `rel="place"` link — so `Subscriptions.GetDeliveryFields`
+  reports which types declare each field, for an editor to warn with.
+
+  Like facets, they are extracted **when a version is stored**, so a field
+  only reaches content published after it was applied. Unlike a facet that
+  is not a gap to backfill: a delivery rule runs at the head of the log.
+
+  The kind decides what a rule can do with the field: `keyword` is an exact
+  value matched against a set, with no analysis and no case folding;
+  `number` is a decimal matched by range; `text` is a bounded extract
+  matched by substring, phrase or prefix — not the document body, which the
+  delivery matcher never reads; `geo` is a `"latitude,longitude"` pair in
+  decimal degrees matched against a circle. A value that cannot be read as
+  its kind is dropped rather than stored as text.
+
 * **`renditions`** blocks — one per asset kind — declare the delivery-time
   rendition configuration: `default_variants`, `default_extension`, and
   ordered `source` blocks that match asset references by block type, link rel

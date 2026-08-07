@@ -82,6 +82,17 @@ type DocumentConfig struct {
 	// only narrows what was published after it was applied - adding one
 	// to a type that already has content means backfilling the rest.
 	Facets []FacetConfig `hcl:"facet,block"`
+
+	// DeliveryFields declare the type's contribution to the delivery-field
+	// vocabulary: the stable public names a delivery rule may reference,
+	// and how each one is read out of a document of this type.
+	//
+	// They are extracted when a version is stored, so a field only reaches
+	// content published after it was applied. There is no backfill, and
+	// unlike a facet that is not a gap to fill in later: a delivery rule
+	// runs at the head of the log, and the one thing that runs rules over
+	// history resolves the boundary itself.
+	DeliveryFields []DeliveryFieldConfig `hcl:"delivery_field,block"`
 }
 
 // FacetConfig extracts one facet's values from a document. The label is
@@ -99,6 +110,45 @@ type DocumentConfig struct {
 type FacetConfig struct {
 	Name       string `hcl:"name,label"`
 	Expression string `hcl:"expression"`
+}
+
+// Delivery field kinds. The kind decides which kind of condition may name
+// the field, and it is fixed for the name across every type that declares
+// it.
+const (
+	// KindKeyword is an exact value: matched against a set, with no
+	// analysis and no case folding. Document UUIDs and codes.
+	KindKeyword = "keyword"
+	// KindNumber is a decimal number, matched by range. A value that
+	// does not read as a number is dropped rather than stored as text.
+	KindNumber = "number"
+	// KindText is human-readable text, matched by substring, phrase or
+	// prefix. It is a bounded extract, not the document body - the
+	// delivery matcher never reads bodies.
+	KindText = "text"
+	// KindGeo is a "latitude,longitude" pair in decimal degrees, matched
+	// against a circle.
+	KindGeo = "geo"
+)
+
+// DeliveryFieldConfig declares one delivery field on a document type. The
+// label is the name a delivery rule references, and it is a public name:
+// several types declare it, each with the expression that finds it in that
+// type, and a rule that names it works across all of them.
+//
+// The kind and description must agree wherever the name is declared. They
+// are properties of the name rather than of the type, and two types
+// disagreeing about them means the name means two things - which the
+// service refuses when the generation is registered.
+//
+// Unlike a facet, the value is not necessarily a UUID: what it should be
+// depends on the kind, and what a rule can do with it depends on the kind
+// too.
+type DeliveryFieldConfig struct {
+	Name        string `hcl:"name,label"`
+	Kind        string `hcl:"kind"`
+	Expression  string `hcl:"expression"`
+	Description string `hcl:"description,optional"`
 }
 
 // TimeExpressionConfig extracts a date or a timespan from a document. It
@@ -283,6 +333,61 @@ func validateDocuments(docs []DocumentConfig) error {
 					doc.Type, f.Name)
 			}
 		}
+
+		err := validateDeliveryFields(doc)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateDeliveryFields checks what a delivery field declaration can be
+// checked for without the API: that it has an expression, that its kind is
+// one of the four, and that the type does not declare the same name twice
+// meaning two different things.
+//
+// An unknown or missing kind is worth catching here for the same reason an
+// unknown anchor is: it decodes cleanly and is a semantic error, and the
+// service is the only other thing that would ever notice.
+//
+// Cross-type agreement is deliberately not checked here. The registry the
+// store path and GetDeliveryFields read is the authority, and a check that
+// only exists in the CLI is a check a direct RPC caller skips.
+func validateDeliveryFields(doc DocumentConfig) error {
+	declared := make(map[string]DeliveryFieldConfig, len(doc.DeliveryFields))
+
+	for _, f := range doc.DeliveryFields {
+		if f.Expression == "" {
+			return fmt.Errorf(
+				"document %q: delivery_field %q has no expression",
+				doc.Type, f.Name)
+		}
+
+		switch f.Kind {
+		case KindKeyword, KindNumber, KindText, KindGeo:
+		default:
+			return fmt.Errorf(
+				"document %q: delivery_field %q has the unknown kind %q, expected %q, %q, %q or %q",
+				doc.Type, f.Name, f.Kind,
+				KindKeyword, KindNumber, KindText, KindGeo)
+		}
+
+		prev, ok := declared[f.Name]
+		if ok && prev.Kind != f.Kind {
+			return fmt.Errorf(
+				"document %q: delivery_field %q is declared as both %q and %q",
+				doc.Type, f.Name, prev.Kind, f.Kind)
+		}
+
+		if ok && prev.Description != f.Description {
+			return fmt.Errorf(
+				"document %q: delivery_field %q is declared with two different descriptions",
+				doc.Type, f.Name)
+		}
+
+		declared[f.Name] = f
 	}
 
 	return nil

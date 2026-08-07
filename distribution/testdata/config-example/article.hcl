@@ -24,4 +24,36 @@ document "core/article" {
   facet "section" {
     expression = ".links(rel='section')@{uuid}"
   }
+
+  # Delivery fields are the vocabulary a delivery rule may name. Unlike a
+  # facet, which narrows a view the caller is already looking at, these
+  # are evaluated against standing rules for content the customer has not
+  # asked for yet - so they are named for the customer's world, not for
+  # the projection, and they are computable without the search index.
+  #
+  # A name means one thing across every type that declares it: the same
+  # "section" is declared on planning items with the expression that
+  # finds it there.
+  delivery_field "section" {
+    kind        = "keyword"
+    expression  = ".links(rel='section')@{uuid}"
+    description = "The section the content was published in."
+  }
+
+  # The editorial newsvalue, as a number so that a rule can ask for
+  # "4 and up" rather than enumerating the scores.
+  delivery_field "newsvalue" {
+    kind        = "number"
+    expression  = ".meta(type='core/newsvalue')@{value}"
+    description = "Editorial newsvalue, 1-6, higher is more important."
+  }
+
+  # The headline, as text, so a rule can match words in it. This is what
+  # a text condition tests: an extracted, bounded piece of the document,
+  # not the body - the delivery matcher never reads bodies.
+  delivery_field "headline" {
+    kind        = "text"
+    expression  = "@{title}"
+    description = "The document headline."
+  }
 }

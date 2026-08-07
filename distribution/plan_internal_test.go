@@ -74,3 +74,70 @@ func TestRenditionConfigToRPCUnknownKind(t *testing.T) {
 			src.BlockTypes, src.LinkRel)
 	}
 }
+
+// A delivery field name is one field per type, so the declarations are a
+// set and their order in the HCL is not information. If the conversion did
+// not put them in a canonical order, reordering two blocks would print a
+// diff line and register a whole new configuration generation - on every
+// apply, forever, since the server would keep storing the order it was
+// last sent.
+func TestDeliveryFieldsToRPC(t *testing.T) {
+	if got := deliveryFieldsToRPC(nil); got != nil {
+		t.Errorf("got %v for an empty set, want nil", got)
+	}
+
+	fields := []DeliveryFieldConfig{
+		{
+			Name:        "section",
+			Kind:        KindKeyword,
+			Expression:  ".links(rel='section')@{uuid}",
+			Description: "The section.",
+		},
+		{
+			Name:       "headline",
+			Kind:       KindText,
+			Expression: "@{title}",
+		},
+		{
+			Name:       "newsvalue",
+			Kind:       KindNumber,
+			Expression: ".meta(type='core/newsvalue')@{value}",
+		},
+	}
+
+	converted := deliveryFieldsToRPC(fields)
+
+	names := make([]string, len(converted))
+	for i, f := range converted {
+		names[i] = f.GetName()
+	}
+
+	if !slices.Equal(names, []string{"headline", "newsvalue", "section"}) {
+		t.Errorf("got the order %v, want it sorted by name", names)
+	}
+
+	section := converted[2]
+
+	if section.GetKind() != KindKeyword ||
+		section.GetExpression() != ".links(rel='section')@{uuid}" ||
+		section.GetDescription() != "The section." {
+		t.Errorf("field not converted whole: %+v", section)
+	}
+
+	reordered := deliveryFieldsToRPC([]DeliveryFieldConfig{
+		fields[2], fields[0], fields[1],
+	})
+
+	if !deliveryFieldsEqual(converted, reordered) {
+		t.Error("reordering the blocks is not a no-op")
+	}
+
+	// The description is what an editor shows beside the name, so a
+	// change to it is a change an apply has to carry.
+	described := slices.Clone(fields)
+	described[1].Description = "The headline."
+
+	if deliveryFieldsEqual(converted, deliveryFieldsToRPC(described)) {
+		t.Error("a description-only change compares equal")
+	}
+}
