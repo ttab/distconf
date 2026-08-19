@@ -26,6 +26,18 @@ type Config struct {
 	Documents     []DocumentConfig             `hcl:"document,block"`
 	Renditions    []RenditionsConfig           `hcl:"renditions,block"`
 
+	// HTMLRendering carries the html_rendering block. At most one may be
+	// declared across the directory, so this is a slice only because a
+	// second one in a second file has to be caught after the merge - use
+	// htmlRendering to read it.
+	HTMLRendering []HTMLRenderingConfig `hcl:"html_rendering,block"`
+
+	// Renderers are the HTML renderer extensions, in declaration order.
+	// The order is information: every invoked renderer answers for
+	// whichever top-level blocks it likes, so two of them can answer for
+	// one block, and the first in this order wins.
+	Renderers []RendererConfig `hcl:"renderer,block"`
+
 	// Schemas is populated by ReadConfigFromDirectory when WithSchemasDir
 	// is used. It contains all schemas loaded from the local directory.
 	Schemas []distconf.LoadedSchema
@@ -230,6 +242,9 @@ func ReadConfigFromDirectory(path string, opts ...ReadOption) (*Config, error) {
 		tutti.SchemaSets = append(tutti.SchemaSets, c.SchemaSets...)
 		tutti.Documents = append(tutti.Documents, c.Documents...)
 		tutti.Renditions = append(tutti.Renditions, c.Renditions...)
+		tutti.HTMLRendering = append(
+			tutti.HTMLRendering, c.HTMLRendering...)
+		tutti.Renderers = append(tutti.Renderers, c.Renderers...)
 
 		return nil
 	})
@@ -267,7 +282,17 @@ func ReadConfigFromDirectory(path string, opts ...ReadOption) (*Config, error) {
 		seenKinds[r.Kind] = true
 	}
 
+	err = resolveHTMLRendering(&tutti)
+	if err != nil {
+		return nil, err
+	}
+
 	err = validateDocuments(tutti.Documents)
+	if err != nil {
+		return nil, err
+	}
+
+	err = resolveRenderers(tutti.Renderers)
 	if err != nil {
 		return nil, err
 	}
@@ -418,12 +443,7 @@ func resolveScriptFiles(conf *Config, dir string) error {
 			)
 		}
 
-		path := doc.TransformFile
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(dir, path)
-		}
-
-		data, err := os.ReadFile(path)
+		script, err := readScriptFile(dir, doc.TransformFile)
 		if err != nil {
 			return fmt.Errorf(
 				"read transform script file for %q: %w",
@@ -431,8 +451,48 @@ func resolveScriptFiles(conf *Config, dir string) error {
 			)
 		}
 
-		doc.TransformScript = string(data)
+		doc.TransformScript = script
+	}
+
+	for i := range conf.Renderers {
+		r := &conf.Renderers[i]
+
+		if r.ScriptFile == "" {
+			continue
+		}
+
+		if r.URL != "" {
+			return fmt.Errorf(
+				"renderer %q: script_file and url are mutually exclusive,"+
+					" a renderer is either a script we run or an endpoint we call",
+				r.Name,
+			)
+		}
+
+		script, err := readScriptFile(dir, r.ScriptFile)
+		if err != nil {
+			return fmt.Errorf(
+				"read renderer script file for %q: %w",
+				r.Name, err,
+			)
+		}
+
+		r.Script = script
 	}
 
 	return nil
+}
+
+func readScriptFile(dir string, name string) (string, error) {
+	path := name
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(dir, path)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read file: %w", err)
+	}
+
+	return string(data), nil
 }

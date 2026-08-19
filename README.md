@@ -208,6 +208,88 @@ schema_set "public" {
   }
   ```
 
+* **`html_rendering`** configures the delivery-time HTML rendering of
+  documents: `image_variant` is the rendition variant the fragment's images
+  link to (default `preview`), and `document_types` is the list of types
+  that render HTML at all. The block may only be declared once across the
+  whole directory.
+
+  **The type list is an opt-in, not a narrowing.** No types at all means no
+  type renders HTML, and leaving the block out — with no `renderer` block
+  either — registers no HTML rendering configuration at all: a deployment
+  that has never thought about HTML delivers none of it, rather than a body
+  fragment of every planning item it happens to configure.
+
+  ```hcl
+  html_rendering {
+    image_variant  = "preview"
+    document_types = ["core/article"]
+  }
+  ```
+
+  The variant is service-level by construction: a fragment is rendered once
+  and cached, so a request cannot pick a variant of its own.
+
+* **`renderer`** blocks register HTML renderer extensions. `kind` is `js`
+  (a script from `script_file`, resolved relative to the configuration
+  directory) or `remote` (an endpoint at `url`); the two sources are
+  mutually exclusive. The renderer is invoked for documents in its
+  `document_types` — none at all means every type — in which some top-level
+  block matches one of its `trigger` blocks; no triggers at all means it is
+  always invoked for those types. Everything it returns is sanitized against
+  its `policy` or `policy_preset` (`strict` or `rich-text`), exactly one of
+  which is required. `revision` busts the render cache and defaults to 1.
+  Names must match `^[a-z0-9][a-z0-9_-]*$`, because a remote renderer's
+  shared secret is read from `REMOTE_SECRET_<NAME>`, and a name may only be
+  declared once across the directory.
+
+  ```hcl
+  renderer "factbox" {
+    kind        = "js"
+    revision    = 1
+    script_file = "factbox-render.js"
+
+    trigger {
+      block_types = ["core/factbox"]
+    }
+
+    policy {
+      elements    = ["aside", "h4", "p", "em", "strong", "a"]
+      attributes  = { a = ["href"] }
+      url_schemes = ["https"]
+    }
+  }
+  ```
+
+  **A trigger is an invocation condition, not a claim on blocks.** Every
+  invoked renderer gets one call carrying the whole document, whose
+  top-level blocks are addressed by id, and answers for whichever of them it
+  likes — the triggers only decided that it was called. Only top-level
+  blocks are addressable: a renderer that wants to change something inside a
+  factbox renders the factbox. Anything no renderer answered for goes to the
+  service's built-in renderers.
+
+  **The order of the blocks is information.** Two renderers may answer for
+  the same block, and the first one in declaration order wins; insertions are
+  applied in that order too. A renderer that fails — a timeout, an
+  exception, a response that does not verify — contributes nothing at all:
+  the blocks it would have answered for fall back to the built-ins and the
+  delivery goes out regardless.
+
+  A remote renderer's endpoint must be `https` unless it sets
+  `allow_insecure`, which leaves the shared secret as the only protection
+  the channel has. There is no forbidden-address check: renderer URLs are
+  operator-configured, and an in-cluster renderer on a private address is
+  the expected deployment. `circuit_breaker` bounds what a failing renderer
+  costs — `timeout` (default `1s`), `failure_threshold` (5),
+  `open_duration` (`30s`) and `max_in_flight` (4) — and a `js` renderer
+  reads the timeout and nothing else, so the other three are refused there.
+
+  **Bump `revision` whenever a remote renderer's output changes.** The
+  render cache is keyed on the configuration that affects output, and an
+  endpoint that starts answering differently has not changed its
+  configuration at all.
+
 `distribution/testdata/config-example/` is a complete, working example of
 such a directory.
 

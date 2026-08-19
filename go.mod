@@ -8,7 +8,7 @@ require (
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/ttab/clitools v1.0.4-0.20260427190724-91a2ef290e9f
 	github.com/ttab/eleconf v1.1.1
-	github.com/ttab/elephant-public-api v0.0.8
+	github.com/ttab/elephant-public-api v0.0.13
 	github.com/ttab/elephantine v0.27.2
 	github.com/ttab/revisor v1.0.0
 	github.com/urfave/cli/v3 v3.10.1

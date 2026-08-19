@@ -2,6 +2,8 @@ package distribution
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -42,11 +44,17 @@ type Plan struct {
 	// desired one, for display purposes.
 	Changes []distconf.ConfigurationChange
 
-	// DesiredSchemas, DesiredTypes, and DesiredRenditions form the full
-	// payload that will be sent to RegisterConfigGeneration.
+	// DesiredSchemas, DesiredTypes, DesiredRenditions and
+	// DesiredRenderers form the full payload that will be sent to
+	// RegisterConfigGeneration.
 	DesiredSchemas    []*dist.ConfigGenerationSchema
 	DesiredTypes      []*dist.ConfigGenerationType
 	DesiredRenditions []*dist.RenditionConfiguration
+
+	// DesiredRenderers is the HTML rendering configuration the
+	// generation should carry, or nil when the configuration declares
+	// none - which is how a generation is left rendering no HTML.
+	DesiredRenderers *HTMLRenderingSpec
 
 	// Description is the human-readable label attached to the new
 	// generation.
@@ -86,6 +94,7 @@ func BuildPlan(
 		activeSchemas    []distconf.SchemaRef
 		activeTypes      map[string]*dist.ConfigGenerationType
 		activeRenditions map[string]*dist.RenditionConfiguration
+		activeRenderers  *HTMLRenderingSpec
 		currentID        int64
 	)
 
@@ -116,6 +125,9 @@ func BuildPlan(
 		for _, r := range active.Generation.Renditions {
 			activeRenditions[r.Kind] = r
 		}
+
+		activeRenderers = htmlRenderingFromRPC(
+			active.Generation.Renderers)
 	}
 
 	renditionTypes, err := renditionLinkTypes(schemas)
@@ -143,13 +155,21 @@ func BuildPlan(
 		return nil, err
 	}
 
-	changes := slices.Concat(schemaChanges, typeChanges, renditionChanges)
+	desiredRenderers, rendererChanges, err := planRenderers(
+		conf, activeRenderers)
+	if err != nil {
+		return nil, err
+	}
+
+	changes := slices.Concat(
+		schemaChanges, typeChanges, renditionChanges, rendererChanges)
 
 	plan := Plan{
 		CurrentGenerationID: currentID,
 		DesiredSchemas:      desiredSchemas,
 		DesiredTypes:        desiredTypes,
 		DesiredRenditions:   desiredRenditions,
+		DesiredRenderers:    desiredRenderers,
 		Description:         description,
 		Changes:             changes,
 	}
@@ -170,6 +190,7 @@ func (p *Plan) Execute(
 			Schemas:     p.DesiredSchemas,
 			Types:       p.DesiredTypes,
 			Renditions:  p.DesiredRenditions,
+			Renderers:   htmlRenderingToRPC(p.DesiredRenderers),
 			Activate:    true,
 		})
 	if err != nil {
@@ -592,6 +613,712 @@ func (c *renditionPlanChange) Describe() (distconf.ChangeOp, string) {
 }
 
 func (c *renditionPlanChange) Warnings() []string {
+	return c.warnings
+}
+
+// HTMLRenderingSpec is the desired HTML rendering configuration: the
+// html_rendering settings and the renderers, with the defaults resolved,
+// in the shape the generation stores them.
+//
+// It is a type of our own rather than the API message because the diff is
+// computed over it: the display shape hashes the script and carries the
+// declaration position, neither of which is a field of the message.
+// htmlRenderingToRPC and htmlRenderingFromRPC are the only two places that
+// know about the message, and between them they have to be each other's
+// inverse - an active generation that reads back as something other than
+// what was sent is a diff no apply can settle.
+type HTMLRenderingSpec struct {
+	ImageVariant  string         `json:"image_variant,omitempty"`
+	DocumentTypes []string       `json:"document_types,omitempty"`
+	Renderers     []RendererSpec `json:"renderers,omitempty"`
+}
+
+// RendererSpec is one renderer as the generation stores it. The script is
+// the content of the configuration's script_file: a generation carries what
+// it will run, not a path into somebody's checkout.
+type RendererSpec struct {
+	Name           string                `json:"name"`
+	Kind           string                `json:"kind"`
+	Revision       int64                 `json:"revision"`
+	Script         string                `json:"script,omitempty"`
+	URL            string                `json:"url,omitempty"`
+	AllowInsecure  bool                  `json:"allow_insecure,omitempty"`
+	Triggers       []RendererTriggerSpec `json:"triggers,omitempty"`
+	DocumentTypes  []string              `json:"document_types,omitempty"`
+	Policy         *RendererPolicySpec   `json:"policy,omitempty"`
+	PolicyPreset   string                `json:"policy_preset,omitempty"`
+	CircuitBreaker *CircuitBreakerSpec   `json:"circuit_breaker,omitempty"`
+}
+
+// RendererTriggerSpec is one condition on the document's top-level blocks
+// that invokes the renderer.
+type RendererTriggerSpec struct {
+	BlockTypes []string `json:"block_types,omitempty"`
+	Roles      []string `json:"roles,omitempty"`
+}
+
+// RendererPolicySpec is a renderer's sanitizer policy.
+type RendererPolicySpec struct {
+	Elements   []string            `json:"elements,omitempty"`
+	Attributes map[string][]string `json:"attributes,omitempty"`
+	URLSchemes []string            `json:"url_schemes,omitempty"`
+}
+
+// CircuitBreakerSpec bounds what a failing renderer costs. Durations are
+// Go duration strings.
+type CircuitBreakerSpec struct {
+	Timeout          string `json:"timeout,omitempty"`
+	FailureThreshold int32  `json:"failure_threshold,omitempty"`
+	OpenDuration     string `json:"open_duration,omitempty"`
+	MaxInFlight      int32  `json:"max_in_flight,omitempty"`
+}
+
+// htmlRenderingSpec builds the desired HTML rendering configuration, or
+// nil when the configuration declares neither an html_rendering block nor
+// a renderer - a deployment that never asked for HTML rendering must send
+// nothing rather than a block of defaults.
+//
+// The renderers keep their declaration order, and that is not cosmetic
+// either: every invoked renderer answers for whichever top-level blocks it
+// likes, and where two of them answer for one block the first in this order
+// wins, so reordering two renderer blocks changes what the output is. It is
+// the opposite of a set of delivery fields, which are sorted precisely
+// because their order means nothing.
+func htmlRenderingSpec(conf *Config) *HTMLRenderingSpec {
+	html := conf.htmlRendering()
+
+	if html == nil && len(conf.Renderers) == 0 {
+		return nil
+	}
+
+	spec := HTMLRenderingSpec{
+		ImageVariant: DefaultImageVariant,
+	}
+
+	if html != nil {
+		spec.ImageVariant = html.ImageVariant
+		spec.DocumentTypes = html.DocumentTypes
+	}
+
+	for _, r := range conf.Renderers {
+		spec.Renderers = append(spec.Renderers, rendererSpec(r))
+	}
+
+	return &spec
+}
+
+func rendererSpec(r RendererConfig) RendererSpec {
+	spec := RendererSpec{
+		Name:          r.Name,
+		Kind:          r.Kind,
+		Revision:      r.Revision,
+		Script:        r.Script,
+		URL:           r.URL,
+		AllowInsecure: r.AllowInsecure,
+		DocumentTypes: r.DocumentTypes,
+		PolicyPreset:  r.PolicyPreset,
+	}
+
+	for _, t := range r.Triggers {
+		spec.Triggers = append(
+			spec.Triggers, RendererTriggerSpec(t))
+	}
+
+	if r.Policy != nil {
+		spec.Policy = &RendererPolicySpec{
+			Elements:   r.Policy.Elements,
+			Attributes: policyAttributes(r.Policy.Attributes),
+			URLSchemes: r.Policy.URLSchemes,
+		}
+	}
+
+	if r.CircuitBreaker != nil {
+		spec.CircuitBreaker = &CircuitBreakerSpec{
+			Timeout:          r.CircuitBreaker.Timeout,
+			FailureThreshold: r.CircuitBreaker.FailureThreshold,
+			OpenDuration:     r.CircuitBreaker.OpenDuration,
+			MaxInFlight:      r.CircuitBreaker.MaxInFlight,
+		}
+	}
+
+	return spec
+}
+
+// policyAttributes copies an attribute allowlist into a canonical shape:
+// no map at all when it is empty, and a nil list for an element that
+// allows no attributes.
+//
+// The normalization is here because the API carries the lists in a message
+// per element, and a declared empty list comes back from the server as a
+// message with no entries. Read as an empty list on one side and a nil one
+// on the other, the two render as different JSON and the renderer diffs
+// against itself for ever. They mean the same thing - an element with no
+// entry keeps no attributes - so they have to compare the same too.
+func policyAttributes(in map[string][]string) map[string][]string {
+	if len(in) == 0 {
+		return nil
+	}
+
+	out := make(map[string][]string, len(in))
+
+	for element, attributes := range in {
+		if len(attributes) == 0 {
+			out[element] = nil
+
+			continue
+		}
+
+		out[element] = attributes
+	}
+
+	return out
+}
+
+// htmlRenderingToRPC converts the desired HTML rendering configuration
+// into the API message, in the arrangement renditions use: the defaults are
+// resolved before this point, so what is sent is what the generation
+// stores and what the next plan reads back.
+//
+// Nil for a configuration that declares neither block. An absent message is
+// what says "render no HTML at all", so a deployment that never asked for
+// it must not have an empty one with a filled-in image variant registered
+// on its behalf.
+func htmlRenderingToRPC(
+	spec *HTMLRenderingSpec,
+) *dist.HTMLRenderingConfiguration {
+	if spec == nil {
+		return nil
+	}
+
+	msg := dist.HTMLRenderingConfiguration{
+		ImageVariant:  spec.ImageVariant,
+		DocumentTypes: spec.DocumentTypes,
+	}
+
+	for _, r := range spec.Renderers {
+		msg.Renderers = append(msg.Renderers, rendererToRPC(r))
+	}
+
+	return &msg
+}
+
+// rendererToRPC, and rendererFromRPC with it, deliberately never touch
+// RendererConfiguration.full_document (field 6). Every invoked renderer is
+// handed the whole document, so there is nothing left for the flag to say.
+// It is only still on the wire because elephant-public-api v0.0.12 shipped
+// with it, and v0.0.13 reserves the field number. Setting it would send a
+// value the service does not read, and reading it would put a field in the
+// plan that no configuration can express - a diff no apply can settle.
+func rendererToRPC(spec RendererSpec) *dist.RendererConfiguration {
+	msg := dist.RendererConfiguration{
+		Name:          spec.Name,
+		Kind:          spec.Kind,
+		Revision:      spec.Revision,
+		Script:        spec.Script,
+		Url:           spec.URL,
+		AllowInsecure: spec.AllowInsecure,
+		DocumentTypes: spec.DocumentTypes,
+		PolicyPreset:  spec.PolicyPreset,
+	}
+
+	for _, t := range spec.Triggers {
+		msg.Triggers = append(msg.Triggers, &dist.RendererTrigger{
+			BlockTypes: t.BlockTypes,
+			Roles:      t.Roles,
+		})
+	}
+
+	if spec.Policy != nil {
+		policy := dist.RendererPolicy{
+			Elements:   spec.Policy.Elements,
+			UrlSchemes: spec.Policy.URLSchemes,
+		}
+
+		if len(spec.Policy.Attributes) > 0 {
+			policy.Attributes = make(
+				map[string]*dist.RendererAttributes,
+				len(spec.Policy.Attributes))
+
+			for element, attributes := range spec.Policy.Attributes {
+				policy.Attributes[element] = &dist.RendererAttributes{
+					Attributes: attributes,
+				}
+			}
+		}
+
+		msg.Policy = &policy
+	}
+
+	if spec.CircuitBreaker != nil {
+		msg.CircuitBreaker = &dist.RendererCircuitBreaker{
+			Timeout:          spec.CircuitBreaker.Timeout,
+			FailureThreshold: spec.CircuitBreaker.FailureThreshold,
+			OpenDuration:     spec.CircuitBreaker.OpenDuration,
+			MaxInFlight:      spec.CircuitBreaker.MaxInFlight,
+		}
+	}
+
+	return &msg
+}
+
+// htmlRenderingFromRPC reads the active generation's HTML rendering
+// configuration. It is htmlRenderingToRPC's inverse, and the two
+// normalizations in it are what make it one:
+//
+// An entirely empty message reads as no configuration at all. Empty
+// document types render no type and no renderer is registered, which is
+// what an absent message says, and reading it as a configuration would
+// diff against a desired nil - a removal an apply carries out by sending
+// nothing, which reads back the same way again on the next run.
+//
+// An empty image variant is the default, the same as an explicit
+// "preview": the service documents it that way, so a generation that
+// stored it compiled and one that stored it as sent have to plan alike.
+func htmlRenderingFromRPC(
+	msg *dist.HTMLRenderingConfiguration,
+) *HTMLRenderingSpec {
+	if msg == nil {
+		return nil
+	}
+
+	if msg.GetImageVariant() == "" && len(msg.GetDocumentTypes()) == 0 &&
+		len(msg.GetRenderers()) == 0 {
+		return nil
+	}
+
+	spec := HTMLRenderingSpec{
+		ImageVariant:  msg.GetImageVariant(),
+		DocumentTypes: msg.GetDocumentTypes(),
+	}
+
+	if spec.ImageVariant == "" {
+		spec.ImageVariant = DefaultImageVariant
+	}
+
+	for _, r := range msg.GetRenderers() {
+		spec.Renderers = append(spec.Renderers, rendererFromRPC(r))
+	}
+
+	return &spec
+}
+
+func rendererFromRPC(msg *dist.RendererConfiguration) RendererSpec {
+	spec := RendererSpec{
+		Name:          msg.GetName(),
+		Kind:          msg.GetKind(),
+		Revision:      msg.GetRevision(),
+		Script:        msg.GetScript(),
+		URL:           msg.GetUrl(),
+		AllowInsecure: msg.GetAllowInsecure(),
+		DocumentTypes: msg.GetDocumentTypes(),
+		PolicyPreset:  msg.GetPolicyPreset(),
+	}
+
+	for _, t := range msg.GetTriggers() {
+		spec.Triggers = append(spec.Triggers, RendererTriggerSpec{
+			BlockTypes: t.GetBlockTypes(),
+			Roles:      t.GetRoles(),
+		})
+	}
+
+	if policy := msg.GetPolicy(); policy != nil {
+		attributes := make(
+			map[string][]string, len(policy.GetAttributes()))
+
+		for element, a := range policy.GetAttributes() {
+			attributes[element] = a.GetAttributes()
+		}
+
+		spec.Policy = &RendererPolicySpec{
+			Elements:   policy.GetElements(),
+			Attributes: policyAttributes(attributes),
+			URLSchemes: policy.GetUrlSchemes(),
+		}
+	}
+
+	if breaker := msg.GetCircuitBreaker(); breaker != nil {
+		read := CircuitBreakerSpec{
+			Timeout: breaker.GetTimeout(),
+		}
+
+		// A js renderer reads the timeout and nothing else, which is why
+		// the configuration refuses the other three on one and this
+		// never sends them. A generation that answers with them filled
+		// in - the service stores the configuration compiled - would
+		// otherwise diff for ever against a configuration that has no
+		// way to say them.
+		if spec.Kind != RendererKindJS {
+			read.FailureThreshold = breaker.GetFailureThreshold()
+			read.OpenDuration = breaker.GetOpenDuration()
+			read.MaxInFlight = breaker.GetMaxInFlight()
+		}
+
+		spec.CircuitBreaker = &read
+	}
+
+	return spec
+}
+
+// planRenderers builds the desired HTML rendering payload and the diff
+// against the active generation's.
+func planRenderers(
+	conf *Config, active *HTMLRenderingSpec,
+) (*HTMLRenderingSpec, []distconf.ConfigurationChange, error) {
+	desired := htmlRenderingSpec(conf)
+
+	configured := make(map[string]bool, len(conf.Documents))
+	for _, doc := range conf.Documents {
+		configured[doc.Type] = true
+	}
+
+	changes, err := planHTMLSettings(desired, active, configured)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rendererChanges, err := planRendererBlocks(desired, active, configured)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return desired, append(changes, rendererChanges...), nil
+}
+
+// planHTMLSettings diffs the html_rendering settings themselves - the
+// image variant and the document types - separately from the renderers, so
+// that a changed image variant does not read as every renderer changing.
+func planHTMLSettings(
+	desired *HTMLRenderingSpec,
+	active *HTMLRenderingSpec,
+	configured map[string]bool,
+) ([]distconf.ConfigurationChange, error) {
+	if desired == nil && active == nil {
+		return nil, nil
+	}
+
+	const subject = "HTML rendering"
+
+	if desired == nil {
+		return []distconf.ConfigurationChange{
+			&rendererPlanChange{
+				subject: subject,
+				op:      distconf.OpRemove,
+			},
+		}, nil
+	}
+
+	wanted, err := htmlSettingsJSON(desired)
+	if err != nil {
+		return nil, fmt.Errorf("render HTML rendering settings: %w", err)
+	}
+
+	warnings := documentTypeWarnings(
+		"html_rendering", desired.DocumentTypes, configured)
+
+	if active == nil {
+		return []distconf.ConfigurationChange{
+			&rendererPlanChange{
+				subject:  subject,
+				wanted:   wanted,
+				op:       distconf.OpAdd,
+				warnings: warnings,
+			},
+		}, nil
+	}
+
+	current, err := htmlSettingsJSON(active)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"render active HTML rendering settings: %w", err)
+	}
+
+	if current == wanted {
+		return nil, nil
+	}
+
+	return []distconf.ConfigurationChange{
+		&rendererPlanChange{
+			subject:  subject,
+			current:  current,
+			wanted:   wanted,
+			op:       distconf.OpUpdate,
+			warnings: warnings,
+		},
+	}, nil
+}
+
+func planRendererBlocks(
+	desired *HTMLRenderingSpec,
+	active *HTMLRenderingSpec,
+	configured map[string]bool,
+) ([]distconf.ConfigurationChange, error) {
+	var (
+		changes []distconf.ConfigurationChange
+		wantedR []RendererSpec
+		activeR []RendererSpec
+	)
+
+	if desired != nil {
+		wantedR = desired.Renderers
+	}
+
+	if active != nil {
+		activeR = active.Renderers
+	}
+
+	activeByName := make(map[string]int, len(activeR))
+	for i, r := range activeR {
+		activeByName[r.Name] = i
+	}
+
+	seen := make(map[string]bool, len(wantedR))
+
+	for i, r := range wantedR {
+		seen[r.Name] = true
+
+		wanted, err := rendererSpecJSON(i, r)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"render renderer %q: %w", r.Name, err)
+		}
+
+		warnings := rendererWarnings(r, configured)
+
+		pos, ok := activeByName[r.Name]
+		if !ok {
+			changes = append(changes, &rendererPlanChange{
+				subject:  rendererSubject(r.Name),
+				wanted:   wanted,
+				op:       distconf.OpAdd,
+				warnings: warnings,
+			})
+
+			continue
+		}
+
+		curr := activeR[pos]
+
+		current, err := rendererSpecJSON(pos, curr)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"render active renderer %q: %w", r.Name, err)
+		}
+
+		if current == wanted {
+			continue
+		}
+
+		changes = append(changes, &rendererPlanChange{
+			subject:    rendererSubject(r.Name),
+			current:    current,
+			wanted:     wanted,
+			scriptDiff: rendererScriptDiff(curr, r),
+			op:         distconf.OpUpdate,
+			warnings:   warnings,
+		})
+	}
+
+	for _, r := range activeR {
+		if seen[r.Name] {
+			continue
+		}
+
+		changes = append(changes, &rendererPlanChange{
+			subject: rendererSubject(r.Name),
+			op:      distconf.OpRemove,
+		})
+	}
+
+	return changes, nil
+}
+
+func rendererSubject(name string) string {
+	return fmt.Sprintf("renderer %q", name)
+}
+
+// rendererScriptDiff is the script change spelled out, since the spec
+// diff only carries the hash of it. A script that appears or disappears is
+// already visible there, so this is the both-sides case only.
+func rendererScriptDiff(current RendererSpec, wanted RendererSpec) string {
+	if current.Script == "" || wanted.Script == "" ||
+		current.Script == wanted.Script {
+		return ""
+	}
+
+	diff := textdiff.Unified(
+		"current script", "wanted script",
+		current.Script, wanted.Script)
+
+	return strings.TrimRight(diff, "\n")
+}
+
+// htmlSettingsDisplay is the canonical JSON shape of the html_rendering
+// settings for a plan line.
+type htmlSettingsDisplay struct {
+	ImageVariant  string   `json:"image_variant,omitempty"`
+	DocumentTypes []string `json:"document_types,omitempty"`
+}
+
+// rendererDisplay is the canonical JSON shape of one renderer for a plan
+// line. The script is a hash rather than the script: an escaped script
+// reads as one unreadable line, and a change to it gets its own diff.
+//
+// The position is in there because a renderer's place in the declaration
+// order decides which of two renderers answering for one block wins, so
+// moving one is a change even when nothing about the renderer itself moved
+// with it.
+type rendererDisplay struct {
+	Position       int                   `json:"position"`
+	Kind           string                `json:"kind"`
+	Revision       int64                 `json:"revision"`
+	ScriptSHA256   string                `json:"script_sha256,omitempty"`
+	URL            string                `json:"url,omitempty"`
+	AllowInsecure  bool                  `json:"allow_insecure,omitempty"`
+	Triggers       []RendererTriggerSpec `json:"triggers,omitempty"`
+	DocumentTypes  []string              `json:"document_types,omitempty"`
+	Policy         *RendererPolicySpec   `json:"policy,omitempty"`
+	PolicyPreset   string                `json:"policy_preset,omitempty"`
+	CircuitBreaker *CircuitBreakerSpec   `json:"circuit_breaker,omitempty"`
+}
+
+func htmlSettingsJSON(spec *HTMLRenderingSpec) (string, error) {
+	data, err := json.MarshalIndent(htmlSettingsDisplay{
+		ImageVariant:  spec.ImageVariant,
+		DocumentTypes: spec.DocumentTypes,
+	}, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal spec: %w", err)
+	}
+
+	return string(data), nil
+}
+
+func rendererSpecJSON(position int, spec RendererSpec) (string, error) {
+	display := rendererDisplay{
+		Position:       position,
+		Kind:           spec.Kind,
+		Revision:       spec.Revision,
+		URL:            spec.URL,
+		AllowInsecure:  spec.AllowInsecure,
+		Triggers:       spec.Triggers,
+		DocumentTypes:  spec.DocumentTypes,
+		Policy:         spec.Policy,
+		PolicyPreset:   spec.PolicyPreset,
+		CircuitBreaker: spec.CircuitBreaker,
+	}
+
+	if spec.Script != "" {
+		hash := sha256.Sum256([]byte(spec.Script))
+		display.ScriptSHA256 = hex.EncodeToString(hash[:])
+	}
+
+	data, err := json.MarshalIndent(display, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal spec: %w", err)
+	}
+
+	return string(data), nil
+}
+
+// rendererWarnings covers the renderer configurations that are valid and
+// probably not what somebody meant.
+func rendererWarnings(
+	spec RendererSpec, configured map[string]bool,
+) []string {
+	warnings := documentTypeWarnings(
+		"renderer "+spec.Name, spec.DocumentTypes, configured)
+
+	if spec.AllowInsecure {
+		warnings = append(warnings, fmt.Sprintf(
+			"renderer %q talks to %s without TLS, so the shared "+
+				"secret is the only thing protecting the channel",
+			spec.Name, spec.URL))
+	}
+
+	if spec.Policy == nil {
+		return warnings
+	}
+
+	allowed := make(map[string]bool, len(spec.Policy.Elements))
+	for _, e := range spec.Policy.Elements {
+		allowed[e] = true
+	}
+
+	for element := range spec.Policy.Attributes {
+		if allowed[element] {
+			continue
+		}
+
+		warnings = append(warnings, fmt.Sprintf(
+			"renderer %q allows attributes on %q, but the policy "+
+				"does not allow the element itself, so the "+
+				"attributes are read by nothing",
+			spec.Name, element))
+	}
+
+	slices.Sort(warnings)
+
+	return warnings
+}
+
+// documentTypeWarnings warns about a scope that names a document type the
+// generation does not configure. It is not an error - a type can be added
+// in the same apply as the scope that names it, but not in a different
+// one - and a renderer scoped to a type nothing else configures never runs.
+func documentTypeWarnings(
+	subject string, types []string, configured map[string]bool,
+) []string {
+	var warnings []string
+
+	for _, t := range types {
+		if configured[t] {
+			continue
+		}
+
+		warnings = append(warnings, fmt.Sprintf(
+			"%s is scoped to the document type %q, which no "+
+				"document block configures, so it never runs",
+			subject, t))
+	}
+
+	return warnings
+}
+
+// rendererPlanChange is a change to the HTML rendering configuration:
+// either one named renderer, or the html_rendering settings themselves.
+type rendererPlanChange struct {
+	subject    string
+	current    string
+	wanted     string
+	scriptDiff string
+	op         distconf.ChangeOp
+	warnings   []string
+}
+
+func (c *rendererPlanChange) Describe() (distconf.ChangeOp, string) {
+	switch c.op {
+	case distconf.OpAdd:
+		return distconf.OpAdd, fmt.Sprintf(
+			"configure %s:\n%s", c.subject, c.wanted)
+	case distconf.OpRemove:
+		return distconf.OpRemove, fmt.Sprintf(
+			"remove %s configuration", c.subject)
+	case distconf.OpUpdate:
+	}
+
+	diff := textdiff.Unified("current", "wanted", c.current, c.wanted)
+
+	message := fmt.Sprintf("update %s configuration:\n%s",
+		c.subject, strings.TrimRight(diff, "\n"))
+
+	if c.scriptDiff != "" {
+		message += "\n" + c.scriptDiff
+	}
+
+	return distconf.OpUpdate, message
+}
+
+func (c *rendererPlanChange) Warnings() []string {
 	return c.warnings
 }
 

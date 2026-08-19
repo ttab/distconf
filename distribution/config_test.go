@@ -3,6 +3,7 @@ package distribution_test
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -216,6 +217,24 @@ func TestReadConfigExample(t *testing.T) {
 
 	if len(conf.Renditions) == 0 {
 		t.Error("no renditions blocks in the example configuration")
+	}
+
+	if len(conf.HTMLRendering) != 1 {
+		t.Errorf("got %d html_rendering blocks in the example, want 1",
+			len(conf.HTMLRendering))
+	}
+
+	if len(conf.Renderers) == 0 {
+		t.Error("no renderers in the example configuration")
+	}
+
+	// script_file references have to be resolved relative to the
+	// configuration directory too, and a renderer script is the one thing
+	// in the example that only that resolution can produce.
+	for _, r := range conf.Renderers {
+		if r.Kind == distribution.RendererKindJS && r.Script == "" {
+			t.Errorf("renderer %q resolved no script", r.Name)
+		}
 	}
 
 	var withScript int
@@ -620,5 +639,522 @@ document "core/article" {
 					tc.errPart, err)
 			}
 		})
+	}
+}
+
+const factboxRendererJS = `
+export function render(req) {
+  return { blocks: [] }
+}
+`
+
+const rendererHCL = `
+html_rendering {
+  image_variant  = "hires"
+  document_types = ["core/article"]
+}
+
+renderer "factbox-special" {
+  kind        = "js"
+  revision    = 3
+  script_file = "factbox.js"
+
+  trigger {
+    block_types = ["core/factbox"]
+    roles       = ["sidebar"]
+  }
+
+  document_types = ["core/article"]
+
+  policy {
+    elements    = ["p", "em", "aside"]
+    attributes  = { p = ["class"] }
+    url_schemes = ["https"]
+  }
+}
+
+renderer "chart" {
+  kind          = "remote"
+  url           = "https://renderers.example.com/chart"
+  policy_preset = "rich-text"
+
+  circuit_breaker {
+    timeout           = "2s"
+    failure_threshold = 3
+    open_duration     = "1m"
+    max_in_flight     = 8
+  }
+}
+`
+
+// TestReadConfigRenderers covers both new blocks: that they decode whole,
+// and that the renderers keep their declaration order - where two of them
+// answer for one block the first one wins, so the order in the
+// configuration decides what the output is.
+func TestReadConfigRenderers(t *testing.T) {
+	dir := writeConfigDir(t, map[string]string{
+		"renderers.hcl": rendererHCL,
+		"factbox.js":    factboxRendererJS,
+	})
+
+	conf, err := distribution.ReadConfigFromDirectory(dir)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+
+	if len(conf.HTMLRendering) != 1 {
+		t.Fatalf("got %d html_rendering blocks, want 1",
+			len(conf.HTMLRendering))
+	}
+
+	html := conf.HTMLRendering[0]
+
+	if html.ImageVariant != "hires" {
+		t.Errorf("image variant not decoded: %q", html.ImageVariant)
+	}
+
+	if !slices.Equal(html.DocumentTypes, []string{"core/article"}) {
+		t.Errorf("document types not decoded: %v", html.DocumentTypes)
+	}
+
+	if len(conf.Renderers) != 2 {
+		t.Fatalf("got %d renderers, want 2", len(conf.Renderers))
+	}
+
+	if conf.Renderers[0].Name != "factbox-special" ||
+		conf.Renderers[1].Name != "chart" {
+		t.Fatalf("renderer order not preserved: %q, %q",
+			conf.Renderers[0].Name, conf.Renderers[1].Name)
+	}
+
+	js := conf.Renderers[0]
+
+	if js.Kind != distribution.RendererKindJS {
+		t.Errorf("kind not decoded: %q", js.Kind)
+	}
+
+	if js.Revision != 3 {
+		t.Errorf("got revision %d, want 3", js.Revision)
+	}
+
+	// The script is a file reference in the configuration and script
+	// content in the generation: a generation carries what it will run.
+	if js.Script != factboxRendererJS {
+		t.Errorf("script file not resolved: %q", js.Script)
+	}
+
+	if len(js.Triggers) != 1 {
+		t.Fatalf("got %d triggers, want 1", len(js.Triggers))
+	}
+
+	if !slices.Equal(js.Triggers[0].BlockTypes, []string{"core/factbox"}) ||
+		!slices.Equal(js.Triggers[0].Roles, []string{"sidebar"}) {
+		t.Errorf("trigger not decoded: %+v", js.Triggers[0])
+	}
+
+	if js.Policy == nil {
+		t.Fatal("policy not decoded")
+	}
+
+	if !slices.Equal(js.Policy.Elements, []string{"p", "em", "aside"}) {
+		t.Errorf("policy elements not decoded: %v", js.Policy.Elements)
+	}
+
+	if !slices.Equal(js.Policy.Attributes["p"], []string{"class"}) {
+		t.Errorf("policy attributes not decoded: %v",
+			js.Policy.Attributes)
+	}
+
+	if !slices.Equal(js.Policy.URLSchemes, []string{"https"}) {
+		t.Errorf("policy url schemes not decoded: %v",
+			js.Policy.URLSchemes)
+	}
+
+	remote := conf.Renderers[1]
+
+	if remote.URL != "https://renderers.example.com/chart" {
+		t.Errorf("url not decoded: %q", remote.URL)
+	}
+
+	if remote.PolicyPreset != distribution.PolicyPresetRichText {
+		t.Errorf("policy preset not decoded: %q", remote.PolicyPreset)
+	}
+
+	breaker := remote.CircuitBreaker
+
+	if breaker == nil {
+		t.Fatal("circuit breaker not decoded")
+	}
+
+	if breaker.Timeout != "2s" || breaker.FailureThreshold != 3 ||
+		breaker.OpenDuration != "1m0s" || breaker.MaxInFlight != 8 {
+		t.Errorf("circuit breaker not decoded: %+v", breaker)
+	}
+}
+
+// TestReadConfigRendererDefaults covers the defaults we resolve rather than
+// leave to the service. The service stores the compiled configuration, so a
+// default it fills in and we don't is a diff every apply reports and no
+// apply settles.
+func TestReadConfigRendererDefaults(t *testing.T) {
+	dir := writeConfigDir(t, map[string]string{
+		"renderers.hcl": `
+html_rendering {}
+
+renderer "chart" {
+  kind          = "remote"
+  url           = "https://renderers.example.com/chart"
+  policy_preset = "strict"
+}
+
+renderer "factbox" {
+  kind          = "js"
+  script_file   = "factbox.js"
+  policy_preset = "strict"
+}
+`,
+		"factbox.js": factboxRendererJS,
+	})
+
+	conf, err := distribution.ReadConfigFromDirectory(dir)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+
+	if conf.HTMLRendering[0].ImageVariant != distribution.DefaultImageVariant {
+		t.Errorf("image variant default not filled in: %q",
+			conf.HTMLRendering[0].ImageVariant)
+	}
+
+	remote := conf.Renderers[0]
+
+	if remote.Revision != 1 {
+		t.Errorf("got revision %d, want the default 1", remote.Revision)
+	}
+
+	breaker := remote.CircuitBreaker
+
+	if breaker == nil {
+		t.Fatal("no circuit breaker defaults filled in")
+	}
+
+	if breaker.Timeout != distribution.DefaultRendererTimeout ||
+		breaker.OpenDuration != distribution.DefaultRendererOpenDuration ||
+		breaker.FailureThreshold !=
+			distribution.DefaultRendererFailureThreshold ||
+		breaker.MaxInFlight != distribution.DefaultRendererMaxInFlight {
+		t.Errorf("circuit breaker defaults not filled in: %+v", breaker)
+	}
+
+	// A script renderer reads the timeout and nothing else, so the
+	// settings that describe a remote endpoint are left unset rather than
+	// sent as values the service would read for nothing.
+	script := conf.Renderers[1].CircuitBreaker
+
+	if script == nil {
+		t.Fatal("no circuit breaker timeout filled in")
+	}
+
+	if script.Timeout != distribution.DefaultRendererTimeout {
+		t.Errorf("timeout default not filled in: %q", script.Timeout)
+	}
+
+	if script.FailureThreshold != 0 || script.OpenDuration != "" ||
+		script.MaxInFlight != 0 {
+		t.Errorf("remote-only breaker settings filled in for a script renderer: %+v",
+			script)
+	}
+}
+
+// TestReadConfigRendererDuplicateName covers a name declared in two files.
+// HCL only rejects duplicate labels within one file, and the name is what a
+// remote renderer's secret is looked up under, so two of them is two
+// renderers sharing one secret and one set of metrics.
+func TestReadConfigRendererDuplicateName(t *testing.T) {
+	dir := writeConfigDir(t, map[string]string{
+		"one.hcl": rendererHCL,
+		"two.hcl": `
+renderer "chart" {
+  kind          = "remote"
+  url           = "https://elsewhere.example.com/chart"
+  policy_preset = "strict"
+}
+`,
+		"factbox.js": factboxRendererJS,
+	})
+
+	_, err := distribution.ReadConfigFromDirectory(dir)
+	if err == nil {
+		t.Fatal("expected an error for a renderer declared in two files")
+	}
+
+	if !strings.Contains(err.Error(), "declared more than once") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestReadConfigHTMLRenderingDuplicateBlock(t *testing.T) {
+	dir := writeConfigDir(t, map[string]string{
+		"one.hcl": "html_rendering {\n  image_variant = \"preview\"\n}\n",
+		"two.hcl": "html_rendering {\n  image_variant = \"hires\"\n}\n",
+	})
+
+	_, err := distribution.ReadConfigFromDirectory(dir)
+	if err == nil {
+		t.Fatal("expected an error for two html_rendering blocks")
+	}
+
+	if !strings.Contains(err.Error(), "only one block") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestReadConfigRendererRefusals covers the renderer declarations that
+// decode cleanly and cannot work, or work as something other than what they
+// say. Nothing here fails in a way an operator sees at apply time.
+func TestReadConfigRendererRefusals(t *testing.T) {
+	cases := map[string]struct {
+		config  string
+		errPart string
+	}{
+		"a script and an endpoint": {
+			config: `
+renderer "factbox" {
+  kind          = "js"
+  script_file   = "factbox.js"
+  url           = "https://renderers.example.com/factbox"
+  policy_preset = "strict"
+}
+`,
+			errPart: "mutually exclusive",
+		},
+		"a script renderer with no script": {
+			config: `
+renderer "factbox" {
+  kind          = "js"
+  policy_preset = "strict"
+}
+`,
+			errPart: "needs a script_file",
+		},
+		"a remote renderer with no url": {
+			config: `
+renderer "chart" {
+  kind          = "remote"
+  policy_preset = "strict"
+}
+`,
+			errPart: "needs a url",
+		},
+		"an unknown kind": {
+			config: `
+renderer "chart" {
+  kind          = "grpc"
+  url           = "https://renderers.example.com/chart"
+  policy_preset = "strict"
+}
+`,
+			errPart: "unknown kind",
+		},
+		"a name the secret lookup cannot spell": {
+			config: `
+renderer "Factbox Special" {
+  kind          = "js"
+  script_file   = "factbox.js"
+  policy_preset = "strict"
+}
+`,
+			errPart: "REMOTE_SECRET_<NAME>",
+		},
+		"an insecure url that does not say so": {
+			config: `
+renderer "chart" {
+  kind          = "remote"
+  url           = "http://renderers.example.com/chart"
+  policy_preset = "strict"
+}
+`,
+			errPart: "allow_insecure",
+		},
+		"an unknown url scheme": {
+			config: `
+renderer "chart" {
+  kind          = "remote"
+  url           = "ftp://renderers.example.com/chart"
+  policy_preset = "strict"
+}
+`,
+			errPart: "expected https or http",
+		},
+		"a policy and a preset": {
+			config: `
+renderer "factbox" {
+  kind          = "js"
+  script_file   = "factbox.js"
+  policy_preset = "strict"
+
+  policy {
+    elements = ["p"]
+  }
+}
+`,
+			errPart: "policy and policy_preset are mutually exclusive",
+		},
+		"neither a policy nor a preset": {
+			config: `
+renderer "factbox" {
+  kind        = "js"
+  script_file = "factbox.js"
+}
+`,
+			errPart: "declare a policy block or a policy_preset",
+		},
+		"an unknown preset": {
+			config: `
+renderer "factbox" {
+  kind          = "js"
+  script_file   = "factbox.js"
+  policy_preset = "permissive"
+}
+`,
+			errPart: "unknown policy_preset",
+		},
+		"a policy that allows nothing": {
+			config: `
+renderer "factbox" {
+  kind        = "js"
+  script_file = "factbox.js"
+
+  policy {
+    attributes = { p = ["class"] }
+  }
+}
+`,
+			errPart: "allows no elements",
+		},
+		"an empty trigger": {
+			config: `
+renderer "factbox" {
+  kind          = "js"
+  script_file   = "factbox.js"
+  policy_preset = "strict"
+
+  trigger {}
+}
+`,
+			errPart: "selects nothing",
+		},
+		"a breaker setting a script renderer does not read": {
+			config: `
+renderer "factbox" {
+  kind          = "js"
+  script_file   = "factbox.js"
+  policy_preset = "strict"
+
+  circuit_breaker {
+    timeout           = "2s"
+    failure_threshold = 3
+  }
+}
+`,
+			errPart: "describe a remote endpoint",
+		},
+		"an endpoint setting a script renderer does not read": {
+			config: `
+renderer "factbox" {
+  kind           = "js"
+  script_file    = "factbox.js"
+  policy_preset  = "strict"
+  allow_insecure = true
+}
+`,
+			errPart: "this renderer is a script",
+		},
+		"a timeout that is not a duration": {
+			config: `
+renderer "chart" {
+  kind          = "remote"
+  url           = "https://renderers.example.com/chart"
+  policy_preset = "strict"
+
+  circuit_breaker {
+    timeout = "one second"
+  }
+}
+`,
+			errPart: "parse timeout",
+		},
+		// full_document was how an earlier draft asked for the whole
+		// document beside the blocks a renderer claimed. Every invoked
+		// renderer gets the whole document now, so the flag is gone -
+		// and it has to be refused rather than ignored, since a
+		// configuration that still sets it was written against
+		// semantics the service no longer has.
+		"the full_document flag of the block-claiming draft": {
+			config: `
+renderer "chart" {
+  kind          = "remote"
+  url           = "https://renderers.example.com/chart"
+  policy_preset = "strict"
+  full_document = true
+}
+`,
+			errPart: "full_document",
+		},
+		"a negative revision": {
+			config: `
+renderer "chart" {
+  kind          = "remote"
+  revision      = -1
+  url           = "https://renderers.example.com/chart"
+  policy_preset = "strict"
+}
+`,
+			errPart: "is negative",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := writeConfigDir(t, map[string]string{
+				"renderer.hcl": tc.config,
+				"factbox.js":   factboxRendererJS,
+			})
+
+			_, err := distribution.ReadConfigFromDirectory(dir)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+
+			if !strings.Contains(err.Error(), tc.errPart) {
+				t.Errorf("expected an error mentioning %q, got %v",
+					tc.errPart, err)
+			}
+		})
+	}
+}
+
+// TestReadConfigRendererInsecureEndpoint covers the endpoint that says so:
+// renderer URLs are operator-configured, and an in-cluster renderer on a
+// plain address is a legitimate deployment.
+func TestReadConfigRendererInsecureEndpoint(t *testing.T) {
+	dir := writeConfigDir(t, map[string]string{
+		"renderer.hcl": `
+renderer "chart" {
+  kind           = "remote"
+  url            = "http://chart-renderer.internal/render"
+  allow_insecure = true
+  policy_preset  = "strict"
+}
+`,
+	})
+
+	conf, err := distribution.ReadConfigFromDirectory(dir)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+
+	if !conf.Renderers[0].AllowInsecure {
+		t.Error("allow_insecure not decoded")
 	}
 }
