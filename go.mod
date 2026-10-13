@@ -3,12 +3,13 @@ module github.com/ttab/distconf
 go 1.27.1
 
 require (
+	connectrpc.com/connect v1.20.0
 	github.com/akedrou/textdiff v0.1.0
 	github.com/fatih/color v1.19.0
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/ttab/clitools v1.0.4-0.20260427190724-91a2ef290e9f
 	github.com/ttab/eleconf v1.1.1
-	github.com/ttab/elephant-public-api v0.1.1-0.20260909134444-1b21a2d0fc4a
+	github.com/ttab/elephant-public-api v0.2.0-pre1
 	github.com/ttab/elephantine v0.27.2
 	github.com/ttab/revisor v1.0.0
 	github.com/urfave/cli/v3 v3.10.1
@@ -16,7 +17,6 @@ require (
 )
 
 require (
-	connectrpc.com/connect v1.20.0 // indirect
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/IvanZagoskin/wkt v0.0.1 // indirect
 	github.com/MicahParks/jwkset v0.11.0 // indirect

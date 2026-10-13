@@ -9,7 +9,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	dist "github.com/ttab/elephant-public-api/distribution"
+	"connectrpc.com/connect"
+	distributionv1 "github.com/ttab/elephant-public-api/elephant/distribution/v1"
 	"github.com/urfave/cli/v3"
 )
 
@@ -152,7 +153,7 @@ type generationListing struct {
 	Generations  []generationEntry `json:"generations"`
 }
 
-func entryFromStatus(status *dist.IndexGenerationStatus) generationEntry {
+func entryFromStatus(status *distributionv1.IndexGenerationStatus) generationEntry {
 	gen := status.Generation
 
 	return generationEntry{
@@ -168,7 +169,7 @@ func entryFromStatus(status *dist.IndexGenerationStatus) generationEntry {
 	}
 }
 
-func entryFromGeneration(gen *dist.IndexGeneration) generationEntry {
+func entryFromGeneration(gen *distributionv1.IndexGeneration) generationEntry {
 	return generationEntry{
 		Name:        gen.Name,
 		Cluster:     gen.Cluster,
@@ -189,11 +190,13 @@ func listGenerationsAction(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("get API clients: %w", err)
 	}
 
-	res, err := clients.Configuration.ListIndexGenerations(ctx,
-		&dist.ListIndexGenerationsRequest{})
+	resp, err := clients.Configuration.ListIndexGenerations(ctx,
+		connect.NewRequest(&distributionv1.ListIndexGenerationsRequest{}))
 	if err != nil {
 		return fmt.Errorf("list index generations: %w", err)
 	}
+
+	res := resp.Msg
 
 	listing := generationListing{
 		EventlogHead: res.EventlogHead,
@@ -244,15 +247,17 @@ func createGenerationAction(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("get API clients: %w", err)
 	}
 
-	res, err := clients.Configuration.CreateIndexGeneration(ctx,
-		&dist.CreateIndexGenerationRequest{
+	resp, err := clients.Configuration.CreateIndexGeneration(ctx,
+		connect.NewRequest(&distributionv1.CreateIndexGenerationRequest{
 			Name:    c.String("name"),
 			Cluster: c.String("cluster"),
 			Prefix:  c.String("prefix"),
-		})
+		}))
 	if err != nil {
 		return fmt.Errorf("create index generation: %w", err)
 	}
+
+	res := resp.Msg
 
 	if c.Bool(flagJSON) {
 		data, err := json.Marshal(entryFromGeneration(res.Generation))
@@ -307,11 +312,13 @@ func waitGenerationAction(ctx context.Context, c *cli.Command) error {
 	defer ticker.Stop()
 
 	for {
-		res, err := clients.Configuration.ListIndexGenerations(ctx,
-			&dist.ListIndexGenerationsRequest{})
+		resp, err := clients.Configuration.ListIndexGenerations(ctx,
+			connect.NewRequest(&distributionv1.ListIndexGenerationsRequest{}))
 		if err != nil {
 			return fmt.Errorf("list index generations: %w", err)
 		}
+
+		res := resp.Msg
 
 		status, err := findGeneration(res.Generations, name)
 		if err != nil {
@@ -348,8 +355,8 @@ func waitGenerationAction(ctx context.Context, c *cli.Command) error {
 }
 
 func findGeneration(
-	generations []*dist.IndexGenerationStatus, name string,
-) (*dist.IndexGenerationStatus, error) {
+	generations []*distributionv1.IndexGenerationStatus, name string,
+) (*distributionv1.IndexGenerationStatus, error) {
 	for _, status := range generations {
 		if status.Generation.Name == name {
 			return status, nil
@@ -377,14 +384,16 @@ func activateGenerationAction(ctx context.Context, c *cli.Command) error {
 		return errors.New("aborted by user")
 	}
 
-	res, err := clients.Configuration.ActivateIndexGeneration(ctx,
-		&dist.ActivateIndexGenerationRequest{
+	resp, err := clients.Configuration.ActivateIndexGeneration(ctx,
+		connect.NewRequest(&distributionv1.ActivateIndexGenerationRequest{
 			Name:  name,
 			Force: c.Bool("force"),
-		})
+		}))
 	if err != nil {
 		return fmt.Errorf("activate index generation: %w", err)
 	}
+
+	res := resp.Msg
 
 	fmt.Fprintf(os.Stdout, "Activated generation %q.\n",
 		res.Generation.Name)
@@ -419,11 +428,13 @@ func deleteGenerationAction(ctx context.Context, c *cli.Command) error {
 		return errors.New("aborted by user")
 	}
 
-	res, err := clients.Configuration.DeleteIndexGeneration(ctx,
-		&dist.DeleteIndexGenerationRequest{Name: name})
+	resp, err := clients.Configuration.DeleteIndexGeneration(ctx,
+		connect.NewRequest(&distributionv1.DeleteIndexGenerationRequest{Name: name}))
 	if err != nil {
 		return fmt.Errorf("delete index generation: %w", err)
 	}
+
+	res := resp.Msg
 
 	fmt.Fprintf(os.Stdout,
 		"Deleted generation %q. The cleanup of its indexes and"+

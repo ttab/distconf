@@ -7,8 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	"connectrpc.com/connect"
 	"github.com/ttab/distconf"
-	dist "github.com/ttab/elephant-public-api/distribution"
+	distributionv1 "github.com/ttab/elephant-public-api/elephant/distribution/v1"
+	"github.com/ttab/elephant-public-api/elephant/distribution/v1/distributionv1connect"
 )
 
 // The distribution service stores the compiled rendition configuration,
@@ -282,7 +284,7 @@ func TestHTMLRenderingFromRPCEmpty(t *testing.T) {
 		t.Errorf("got %+v for an absent message, want nil", spec)
 	}
 
-	spec := htmlRenderingFromRPC(&dist.HTMLRenderingConfiguration{})
+	spec := htmlRenderingFromRPC(&distributionv1.HTMLRenderingConfiguration{})
 	if spec != nil {
 		t.Errorf("got %+v for an empty message, want nil", spec)
 	}
@@ -295,7 +297,7 @@ func TestHTMLRenderingFromRPCEmpty(t *testing.T) {
 // An empty image variant is the default, so a generation that stored it
 // compiled and one that stored it as sent have to plan alike.
 func TestHTMLRenderingFromRPCDefaultsTheImageVariant(t *testing.T) {
-	spec := htmlRenderingFromRPC(&dist.HTMLRenderingConfiguration{
+	spec := htmlRenderingFromRPC(&distributionv1.HTMLRenderingConfiguration{
 		DocumentTypes: []string{"core/article"},
 	})
 
@@ -314,12 +316,12 @@ func TestHTMLRenderingFromRPCDefaultsTheImageVariant(t *testing.T) {
 // that answers with them filled in, as it would if the service materialized
 // the defaults it compiles, must not read as a change nothing can express.
 func TestRendererFromRPCIgnoresRemoteBreakerSettingsOnAScript(t *testing.T) {
-	spec := rendererFromRPC(&dist.RendererConfiguration{
+	spec := rendererFromRPC(&distributionv1.RendererConfiguration{
 		Name:     "factbox",
 		Kind:     RendererKindJS,
 		Revision: 1,
 		Script:   "export function render() {}",
-		CircuitBreaker: &dist.RendererCircuitBreaker{
+		CircuitBreaker: &distributionv1.RendererCircuitBreaker{
 			Timeout:          DefaultRendererTimeout,
 			FailureThreshold: DefaultRendererFailureThreshold,
 			OpenDuration:     DefaultRendererOpenDuration,
@@ -353,35 +355,39 @@ func TestRendererFromRPCIgnoresRemoteBreakerSettingsOnAScript(t *testing.T) {
 // the service, and a call that does panics here rather than being answered
 // with something plausible.
 type stubConfiguration struct {
-	dist.Configuration
+	distributionv1connect.ConfigurationServiceClient
 
-	generation *dist.ConfigGeneration
-	registered *dist.RegisterConfigGenerationRequest
+	generation *distributionv1.ConfigGeneration
+	registered *distributionv1.RegisterConfigGenerationRequest
 }
 
 func (s *stubConfiguration) GetActiveConfigGeneration(
-	_ context.Context, _ *dist.GetActiveConfigGenerationRequest,
-) (*dist.GetActiveConfigGenerationResponse, error) {
-	return &dist.GetActiveConfigGenerationResponse{
+	_ context.Context,
+	_ *connect.Request[distributionv1.GetActiveConfigGenerationRequest],
+) (*connect.Response[distributionv1.GetActiveConfigGenerationResponse], error) {
+	return connect.NewResponse(&distributionv1.GetActiveConfigGenerationResponse{
 		Generation: s.generation,
-	}, nil
+	}), nil
 }
 
 func (s *stubConfiguration) RegisterConfigGeneration(
-	_ context.Context, req *dist.RegisterConfigGenerationRequest,
-) (*dist.RegisterConfigGenerationResponse, error) {
+	_ context.Context,
+	creq *connect.Request[distributionv1.RegisterConfigGenerationRequest],
+) (*connect.Response[distributionv1.RegisterConfigGenerationResponse], error) {
+	req := creq.Msg
+
 	s.registered = req
 
-	s.generation = &dist.ConfigGeneration{
+	s.generation = &distributionv1.ConfigGeneration{
 		Id:         s.generation.GetId() + 1,
 		Types:      req.GetTypes(),
 		Renditions: req.GetRenditions(),
 		Renderers:  req.GetRenderers(),
 	}
 
-	return &dist.RegisterConfigGenerationResponse{
+	return connect.NewResponse(&distributionv1.RegisterConfigGenerationResponse{
 		Generation: s.generation,
-	}, nil
+	}), nil
 }
 
 // The whole point of resolving the defaults before the payload is built:

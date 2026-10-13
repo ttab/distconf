@@ -9,14 +9,16 @@ import (
 	"slices"
 	"strings"
 
+	"connectrpc.com/connect"
 	"github.com/akedrou/textdiff"
 	"github.com/ttab/distconf"
-	dist "github.com/ttab/elephant-public-api/distribution"
+	distributionv1 "github.com/ttab/elephant-public-api/elephant/distribution/v1"
+	"github.com/ttab/elephant-public-api/elephant/distribution/v1/distributionv1connect"
 )
 
-// Clients provides access to the distribution Twirp API.
+// Clients provides access to the distribution Connect API.
 type Clients interface {
-	GetConfiguration() dist.Configuration
+	GetConfiguration() distributionv1connect.ConfigurationServiceClient
 }
 
 // Interface guard.
@@ -24,11 +26,11 @@ var _ Clients = &StaticClients{}
 
 // StaticClients is a concrete implementation of Clients.
 type StaticClients struct {
-	Configuration dist.Configuration
+	Configuration distributionv1connect.ConfigurationServiceClient
 }
 
 // GetConfiguration implements Clients.
-func (c *StaticClients) GetConfiguration() dist.Configuration {
+func (c *StaticClients) GetConfiguration() distributionv1connect.ConfigurationServiceClient {
 	return c.Configuration
 }
 
@@ -47,9 +49,9 @@ type Plan struct {
 	// DesiredSchemas, DesiredTypes, DesiredRenditions and
 	// DesiredRenderers form the full payload that will be sent to
 	// RegisterConfigGeneration.
-	DesiredSchemas    []*dist.ConfigGenerationSchema
-	DesiredTypes      []*dist.ConfigGenerationType
-	DesiredRenditions []*dist.RenditionConfiguration
+	DesiredSchemas    []*distributionv1.ConfigGenerationSchema
+	DesiredTypes      []*distributionv1.ConfigGenerationType
+	DesiredRenditions []*distributionv1.RenditionConfiguration
 
 	// DesiredRenderers is the HTML rendering configuration the
 	// generation should carry, or nil when the configuration declares
@@ -84,16 +86,18 @@ func BuildPlan(
 
 	config := clients.GetConfiguration()
 
-	active, err := config.GetActiveConfigGeneration(ctx,
-		&dist.GetActiveConfigGenerationRequest{})
+	activeRes, err := config.GetActiveConfigGeneration(ctx,
+		connect.NewRequest(&distributionv1.GetActiveConfigGenerationRequest{}))
 	if err != nil {
 		return nil, fmt.Errorf("read active generation: %w", err)
 	}
 
+	active := activeRes.Msg
+
 	var (
 		activeSchemas    []distconf.SchemaRef
-		activeTypes      map[string]*dist.ConfigGenerationType
-		activeRenditions map[string]*dist.RenditionConfiguration
+		activeTypes      map[string]*distributionv1.ConfigGenerationType
+		activeRenditions map[string]*distributionv1.RenditionConfiguration
 		activeRenderers  *HTMLRenderingSpec
 		currentID        int64
 	)
@@ -113,14 +117,14 @@ func BuildPlan(
 		}
 
 		activeTypes = make(
-			map[string]*dist.ConfigGenerationType,
+			map[string]*distributionv1.ConfigGenerationType,
 			len(active.Generation.Types))
 		for _, t := range active.Generation.Types {
 			activeTypes[t.Type] = t
 		}
 
 		activeRenditions = make(
-			map[string]*dist.RenditionConfiguration,
+			map[string]*distributionv1.RenditionConfiguration,
 			len(active.Generation.Renditions))
 		for _, r := range active.Generation.Renditions {
 			activeRenditions[r.Kind] = r
@@ -138,9 +142,9 @@ func BuildPlan(
 	desiredRefs, schemaChanges := distconf.PlanSchemas(schemas, activeSchemas)
 
 	desiredSchemas := make(
-		[]*dist.ConfigGenerationSchema, len(desiredRefs))
+		[]*distributionv1.ConfigGenerationSchema, len(desiredRefs))
 	for i, ref := range desiredRefs {
-		desiredSchemas[i] = &dist.ConfigGenerationSchema{
+		desiredSchemas[i] = &distributionv1.ConfigGenerationSchema{
 			Name:    ref.Name,
 			Version: ref.Version,
 			Spec:    ref.Spec,
@@ -181,23 +185,23 @@ func BuildPlan(
 // newly activated generation.
 func (p *Plan) Execute(
 	ctx context.Context, clients Clients,
-) (*dist.ConfigGeneration, error) {
+) (*distributionv1.ConfigGeneration, error) {
 	config := clients.GetConfiguration()
 
 	res, err := config.RegisterConfigGeneration(ctx,
-		&dist.RegisterConfigGenerationRequest{
+		connect.NewRequest(&distributionv1.RegisterConfigGenerationRequest{
 			Description: p.Description,
 			Schemas:     p.DesiredSchemas,
 			Types:       p.DesiredTypes,
 			Renditions:  p.DesiredRenditions,
 			Renderers:   htmlRenderingToRPC(p.DesiredRenderers),
 			Activate:    true,
-		})
+		}))
 	if err != nil {
 		return nil, fmt.Errorf("register generation: %w", err)
 	}
 
-	return res.Generation, nil
+	return res.Msg.Generation, nil
 }
 
 // validateConfigTypes verifies that every document type configured in the
@@ -213,9 +217,9 @@ func validateConfigTypes(conf *Config, schemas []distconf.LoadedSchema) error {
 
 func planTypes(
 	conf *Config,
-	active map[string]*dist.ConfigGenerationType,
-) ([]*dist.ConfigGenerationType, []distconf.ConfigurationChange) {
-	desired := make([]*dist.ConfigGenerationType, 0, len(conf.Documents))
+	active map[string]*distributionv1.ConfigGenerationType,
+) ([]*distributionv1.ConfigGenerationType, []distconf.ConfigurationChange) {
+	desired := make([]*distributionv1.ConfigGenerationType, 0, len(conf.Documents))
 	seen := make(map[string]bool, len(conf.Documents))
 
 	var changes []distconf.ConfigurationChange
@@ -223,9 +227,9 @@ func planTypes(
 	for _, doc := range conf.Documents {
 		seen[doc.Type] = true
 
-		entry := &dist.ConfigGenerationType{
+		entry := &distributionv1.ConfigGenerationType{
 			Type: doc.Type,
-			Configuration: &dist.TypeConfiguration{
+			Configuration: &distributionv1.TypeConfiguration{
 				TransformScript:   doc.TransformScript,
 				BoundedCollection: doc.BoundedCollection,
 				Variants:          doc.Variants,
@@ -250,7 +254,7 @@ func planTypes(
 		default:
 			currConf := curr.Configuration
 			if currConf == nil {
-				currConf = &dist.TypeConfiguration{}
+				currConf = &distributionv1.TypeConfiguration{}
 			}
 
 			settingsDiff := typeSettingsDiff(currConf, doc)
@@ -295,10 +299,10 @@ func planTypes(
 // delivered documents would fail consumer-side validation.
 func planRenditions(
 	conf *Config,
-	active map[string]*dist.RenditionConfiguration,
+	active map[string]*distributionv1.RenditionConfiguration,
 	renditionTypes map[string]bool,
-) ([]*dist.RenditionConfiguration, []distconf.ConfigurationChange, error) {
-	desired := make([]*dist.RenditionConfiguration, 0, len(conf.Renditions))
+) ([]*distributionv1.RenditionConfiguration, []distconf.ConfigurationChange, error) {
+	desired := make([]*distributionv1.RenditionConfiguration, 0, len(conf.Renditions))
 	seen := make(map[string]bool, len(conf.Renditions))
 
 	var changes []distconf.ConfigurationChange
@@ -387,13 +391,13 @@ func renditionKindDefaults(kind string) ([]string, string) {
 	}
 }
 
-func renditionConfigToRPC(rc RenditionsConfig) *dist.RenditionConfiguration {
-	entry := dist.RenditionConfiguration{
+func renditionConfigToRPC(rc RenditionsConfig) *distributionv1.RenditionConfiguration {
+	entry := distributionv1.RenditionConfiguration{
 		Kind:             rc.Kind,
 		DefaultVariants:  rc.DefaultVariants,
 		DefaultExtension: rc.DefaultExtension,
 		Sources: make(
-			[]*dist.RenditionSource, len(rc.Sources)),
+			[]*distributionv1.RenditionSource, len(rc.Sources)),
 	}
 
 	defBlocks, defRel := renditionKindDefaults(rc.Kind)
@@ -409,7 +413,7 @@ func renditionConfigToRPC(rc RenditionsConfig) *dist.RenditionConfiguration {
 			linkRel = defRel
 		}
 
-		entry.Sources[i] = &dist.RenditionSource{
+		entry.Sources[i] = &distributionv1.RenditionSource{
 			Name:       src.Name,
 			Namespace:  src.Namespace,
 			BlockTypes: blockTypes,
@@ -439,7 +443,7 @@ type renditionSourceSpec struct {
 	URIPattern string   `json:"uri_pattern"`
 }
 
-func renditionSpecJSON(rc *dist.RenditionConfiguration) (string, error) {
+func renditionSpecJSON(rc *distributionv1.RenditionConfiguration) (string, error) {
 	spec := renditionKindSpec{
 		DefaultVariants:  rc.DefaultVariants,
 		DefaultExtension: rc.DefaultExtension,
@@ -473,7 +477,7 @@ func renditionSpecJSON(rc *dist.RenditionConfiguration) (string, error) {
 // renditionSchemaWarnings warns about sources whose block types have no
 // rel "rendition" link declared by any desired schema.
 func renditionSchemaWarnings(
-	rc *dist.RenditionConfiguration, renditionTypes map[string]bool,
+	rc *distributionv1.RenditionConfiguration, renditionTypes map[string]bool,
 ) []string {
 	var warnings []string
 
@@ -785,12 +789,12 @@ func policyAttributes(in map[string][]string) map[string][]string {
 // on its behalf.
 func htmlRenderingToRPC(
 	spec *HTMLRenderingSpec,
-) *dist.HTMLRenderingConfiguration {
+) *distributionv1.HTMLRenderingConfiguration {
 	if spec == nil {
 		return nil
 	}
 
-	msg := dist.HTMLRenderingConfiguration{
+	msg := distributionv1.HTMLRenderingConfiguration{
 		ImageVariant:  spec.ImageVariant,
 		DocumentTypes: spec.DocumentTypes,
 	}
@@ -809,8 +813,8 @@ func htmlRenderingToRPC(
 // with it, and v0.0.13 reserves the field number. Setting it would send a
 // value the service does not read, and reading it would put a field in the
 // plan that no configuration can express - a diff no apply can settle.
-func rendererToRPC(spec RendererSpec) *dist.RendererConfiguration {
-	msg := dist.RendererConfiguration{
+func rendererToRPC(spec RendererSpec) *distributionv1.RendererConfiguration {
+	msg := distributionv1.RendererConfiguration{
 		Name:          spec.Name,
 		Kind:          spec.Kind,
 		Revision:      spec.Revision,
@@ -822,25 +826,25 @@ func rendererToRPC(spec RendererSpec) *dist.RendererConfiguration {
 	}
 
 	for _, t := range spec.Triggers {
-		msg.Triggers = append(msg.Triggers, &dist.RendererTrigger{
+		msg.Triggers = append(msg.Triggers, &distributionv1.RendererTrigger{
 			BlockTypes: t.BlockTypes,
 			Roles:      t.Roles,
 		})
 	}
 
 	if spec.Policy != nil {
-		policy := dist.RendererPolicy{
+		policy := distributionv1.RendererPolicy{
 			Elements:   spec.Policy.Elements,
 			UrlSchemes: spec.Policy.URLSchemes,
 		}
 
 		if len(spec.Policy.Attributes) > 0 {
 			policy.Attributes = make(
-				map[string]*dist.RendererAttributes,
+				map[string]*distributionv1.RendererAttributes,
 				len(spec.Policy.Attributes))
 
 			for element, attributes := range spec.Policy.Attributes {
-				policy.Attributes[element] = &dist.RendererAttributes{
+				policy.Attributes[element] = &distributionv1.RendererAttributes{
 					Attributes: attributes,
 				}
 			}
@@ -850,7 +854,7 @@ func rendererToRPC(spec RendererSpec) *dist.RendererConfiguration {
 	}
 
 	if spec.CircuitBreaker != nil {
-		msg.CircuitBreaker = &dist.RendererCircuitBreaker{
+		msg.CircuitBreaker = &distributionv1.RendererCircuitBreaker{
 			Timeout:          spec.CircuitBreaker.Timeout,
 			FailureThreshold: spec.CircuitBreaker.FailureThreshold,
 			OpenDuration:     spec.CircuitBreaker.OpenDuration,
@@ -875,7 +879,7 @@ func rendererToRPC(spec RendererSpec) *dist.RendererConfiguration {
 // "preview": the service documents it that way, so a generation that
 // stored it compiled and one that stored it as sent have to plan alike.
 func htmlRenderingFromRPC(
-	msg *dist.HTMLRenderingConfiguration,
+	msg *distributionv1.HTMLRenderingConfiguration,
 ) *HTMLRenderingSpec {
 	if msg == nil {
 		return nil
@@ -902,7 +906,7 @@ func htmlRenderingFromRPC(
 	return &spec
 }
 
-func rendererFromRPC(msg *dist.RendererConfiguration) RendererSpec {
+func rendererFromRPC(msg *distributionv1.RendererConfiguration) RendererSpec {
 	spec := RendererSpec{
 		Name:          msg.GetName(),
 		Kind:          msg.GetKind(),
@@ -1329,7 +1333,7 @@ const summaryNone = "none"
 // typeSettingsDiff describes changes to the non-script type settings,
 // or returns an empty string when they are unchanged.
 func typeSettingsDiff(
-	curr *dist.TypeConfiguration, doc DocumentConfig,
+	curr *distributionv1.TypeConfiguration, doc DocumentConfig,
 ) string {
 	var lines []string
 
@@ -1400,15 +1404,15 @@ func typeSettingsDiff(
 // are unioned, so their order is arguably information. This one is not.
 func deliveryFieldsToRPC(
 	fields []DeliveryFieldConfig,
-) []*dist.TypeDeliveryField {
+) []*distributionv1.TypeDeliveryField {
 	if len(fields) == 0 {
 		return nil
 	}
 
-	out := make([]*dist.TypeDeliveryField, len(fields))
+	out := make([]*distributionv1.TypeDeliveryField, len(fields))
 
 	for i, f := range fields {
-		out[i] = &dist.TypeDeliveryField{
+		out[i] = &distributionv1.TypeDeliveryField{
 			Name:        f.Name,
 			Kind:        f.Kind,
 			Expression:  f.Expression,
@@ -1416,7 +1420,7 @@ func deliveryFieldsToRPC(
 		}
 	}
 
-	slices.SortFunc(out, func(x, y *dist.TypeDeliveryField) int {
+	slices.SortFunc(out, func(x, y *distributionv1.TypeDeliveryField) int {
 		return strings.Compare(x.GetName(), y.GetName())
 	})
 
@@ -1428,11 +1432,11 @@ func deliveryFieldsToRPC(
 // so both are already name-sorted and a positional comparison is a set
 // comparison. Sorting a defensive copy of the current side first costs
 // nothing and makes that independent of the server having preserved order.
-func deliveryFieldsEqual(a, b []*dist.TypeDeliveryField) bool {
+func deliveryFieldsEqual(a, b []*distributionv1.TypeDeliveryField) bool {
 	as := slices.Clone(a)
 	bs := slices.Clone(b)
 
-	byName := func(x, y *dist.TypeDeliveryField) int {
+	byName := func(x, y *distributionv1.TypeDeliveryField) int {
 		return strings.Compare(x.GetName(), y.GetName())
 	}
 
@@ -1440,7 +1444,7 @@ func deliveryFieldsEqual(a, b []*dist.TypeDeliveryField) bool {
 	slices.SortFunc(bs, byName)
 
 	return slices.EqualFunc(as, bs,
-		func(x, y *dist.TypeDeliveryField) bool {
+		func(x, y *distributionv1.TypeDeliveryField) bool {
 			return x.GetName() == y.GetName() &&
 				x.GetKind() == y.GetKind() &&
 				x.GetExpression() == y.GetExpression() &&
@@ -1449,7 +1453,7 @@ func deliveryFieldsEqual(a, b []*dist.TypeDeliveryField) bool {
 }
 
 // deliveryFieldSummary renders delivery fields for a plan line.
-func deliveryFieldSummary(fields []*dist.TypeDeliveryField) string {
+func deliveryFieldSummary(fields []*distributionv1.TypeDeliveryField) string {
 	if len(fields) == 0 {
 		return summaryNone
 	}
@@ -1466,15 +1470,15 @@ func deliveryFieldSummary(fields []*dist.TypeDeliveryField) string {
 
 // facetsToRPC converts the configured facet expressions into the API
 // representation.
-func facetsToRPC(facets []FacetConfig) []*dist.TypeFacetExpression {
+func facetsToRPC(facets []FacetConfig) []*distributionv1.TypeFacetExpression {
 	if len(facets) == 0 {
 		return nil
 	}
 
-	out := make([]*dist.TypeFacetExpression, len(facets))
+	out := make([]*distributionv1.TypeFacetExpression, len(facets))
 
 	for i, f := range facets {
-		out[i] = &dist.TypeFacetExpression{
+		out[i] = &distributionv1.TypeFacetExpression{
 			Name:       f.Name,
 			Expression: f.Expression,
 		}
@@ -1486,16 +1490,16 @@ func facetsToRPC(facets []FacetConfig) []*dist.TypeFacetExpression {
 // facetsEqual compares two sets of facet expressions. Order is part of
 // the value, as it is for time expressions: the stored configuration is a
 // list and is replaced whole.
-func facetsEqual(a, b []*dist.TypeFacetExpression) bool {
+func facetsEqual(a, b []*distributionv1.TypeFacetExpression) bool {
 	return slices.EqualFunc(a, b,
-		func(x, y *dist.TypeFacetExpression) bool {
+		func(x, y *distributionv1.TypeFacetExpression) bool {
 			return x.GetName() == y.GetName() &&
 				x.GetExpression() == y.GetExpression()
 		})
 }
 
 // facetSummary renders facet expressions for a plan line.
-func facetSummary(facets []*dist.TypeFacetExpression) string {
+func facetSummary(facets []*distributionv1.TypeFacetExpression) string {
 	if len(facets) == 0 {
 		return summaryNone
 	}
@@ -1513,15 +1517,15 @@ func facetSummary(facets []*dist.TypeFacetExpression) string {
 // API representation.
 func timeExpressionsToRPC(
 	expressions []TimeExpressionConfig,
-) []*dist.TypeTimeExpression {
+) []*distributionv1.TypeTimeExpression {
 	if len(expressions) == 0 {
 		return nil
 	}
 
-	out := make([]*dist.TypeTimeExpression, len(expressions))
+	out := make([]*distributionv1.TypeTimeExpression, len(expressions))
 
 	for i, e := range expressions {
-		out[i] = &dist.TypeTimeExpression{
+		out[i] = &distributionv1.TypeTimeExpression{
 			Expression: e.Expression,
 			Layout:     e.Layout,
 			Timezone:   e.Timezone,
@@ -1534,9 +1538,9 @@ func timeExpressionsToRPC(
 // timeExpressionsEqual compares two sets of time expressions. Order is
 // part of the value: the extractor merges the spans it gets, but the
 // stored configuration is a list and is replaced whole.
-func timeExpressionsEqual(a, b []*dist.TypeTimeExpression) bool {
+func timeExpressionsEqual(a, b []*distributionv1.TypeTimeExpression) bool {
 	return slices.EqualFunc(a, b,
-		func(x, y *dist.TypeTimeExpression) bool {
+		func(x, y *distributionv1.TypeTimeExpression) bool {
 			return x.GetExpression() == y.GetExpression() &&
 				x.GetLayout() == y.GetLayout() &&
 				x.GetTimezone() == y.GetTimezone()
@@ -1544,7 +1548,7 @@ func timeExpressionsEqual(a, b []*dist.TypeTimeExpression) bool {
 }
 
 // timeExpressionSummary renders time expressions for a plan line.
-func timeExpressionSummary(expressions []*dist.TypeTimeExpression) string {
+func timeExpressionSummary(expressions []*distributionv1.TypeTimeExpression) string {
 	if len(expressions) == 0 {
 		return summaryNone
 	}

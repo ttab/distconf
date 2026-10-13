@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	dist "github.com/ttab/elephant-public-api/distribution"
+	"connectrpc.com/connect"
+	distributionv1 "github.com/ttab/elephant-public-api/elephant/distribution/v1"
 	"github.com/urfave/cli/v3"
 )
 
@@ -55,7 +56,7 @@ func setSyncStateAction(desired string) cli.ActionFunc {
 		}
 
 		_, err = clients.Configuration.SetSyncState(ctx,
-			&dist.SetSyncStateRequest{Desired: desired})
+			connect.NewRequest(&distributionv1.SetSyncStateRequest{Desired: desired}))
 		if err != nil {
 			return fmt.Errorf("set sync state to %q: %w", desired, err)
 		}
@@ -74,11 +75,13 @@ func syncStatusAction(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("get API clients: %w", err)
 	}
 
-	status, err := clients.Configuration.GetSyncStatus(ctx,
-		&dist.GetSyncStatusRequest{})
+	statusRes, err := clients.Configuration.GetSyncStatus(ctx,
+		connect.NewRequest(&distributionv1.GetSyncStatusRequest{}))
 	if err != nil {
 		return fmt.Errorf("get sync status: %w", err)
 	}
+
+	status := statusRes.Msg
 
 	fmt.Fprintf(os.Stdout, "Desired:  %s\n", status.Desired)
 	fmt.Fprintf(os.Stdout, "Current:  %s\n", status.Current)

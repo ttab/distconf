@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"slices"
 
+	"connectrpc.com/connect"
 	"github.com/ttab/distconf"
-	liveapi "github.com/ttab/elephant-public-api/live"
+	livev1 "github.com/ttab/elephant-public-api/elephant/live/v1"
+	"github.com/ttab/elephant-public-api/elephant/live/v1/livev1connect"
 )
 
-// Clients provides access to the live Twirp API.
+// Clients provides access to the live Connect API.
 type Clients interface {
-	GetConfiguration() liveapi.Configuration
+	GetConfiguration() livev1connect.ConfigurationServiceClient
 }
 
 // Interface guard.
@@ -19,11 +21,11 @@ var _ Clients = &StaticClients{}
 
 // StaticClients is a concrete implementation of Clients.
 type StaticClients struct {
-	Configuration liveapi.Configuration
+	Configuration livev1connect.ConfigurationServiceClient
 }
 
 // GetConfiguration implements Clients.
-func (c *StaticClients) GetConfiguration() liveapi.Configuration {
+func (c *StaticClients) GetConfiguration() livev1connect.ConfigurationServiceClient {
 	return c.Configuration
 }
 
@@ -41,7 +43,7 @@ type Plan struct {
 
 	// DesiredSchemas and DesiredPostTypes form the full payload that
 	// will be sent to RegisterConfigGeneration.
-	DesiredSchemas   []*liveapi.ConfigGenerationSchema
+	DesiredSchemas   []*livev1.ConfigGenerationSchema
 	DesiredPostTypes []string
 
 	// Description is the human-readable label attached to the new
@@ -80,13 +82,15 @@ func BuildPlan(
 	// A known_id that can never match an actual generation makes the
 	// server respond immediately instead of long-polling for a change
 	// when no generation is active yet.
-	active, err := config.GetActiveConfigGeneration(ctx,
-		&liveapi.GetActiveConfigGenerationRequest{
+	activeRes, err := config.GetActiveConfigGeneration(ctx,
+		connect.NewRequest(&livev1.GetActiveConfigGenerationRequest{
 			KnownId: -1,
-		})
+		}))
 	if err != nil {
 		return nil, fmt.Errorf("read active generation: %w", err)
 	}
+
+	active := activeRes.Msg
 
 	var (
 		activeSchemas   []distconf.SchemaRef
@@ -113,9 +117,9 @@ func BuildPlan(
 	desiredRefs, schemaChanges := distconf.PlanSchemas(schemas, activeSchemas)
 
 	desiredSchemas := make(
-		[]*liveapi.ConfigGenerationSchema, len(desiredRefs))
+		[]*livev1.ConfigGenerationSchema, len(desiredRefs))
 	for i, ref := range desiredRefs {
-		desiredSchemas[i] = &liveapi.ConfigGenerationSchema{
+		desiredSchemas[i] = &livev1.ConfigGenerationSchema{
 			Name:    ref.Name,
 			Version: ref.Version,
 			Spec:    ref.Spec,
@@ -139,21 +143,21 @@ func BuildPlan(
 // newly activated generation.
 func (p *Plan) Execute(
 	ctx context.Context, clients Clients,
-) (*liveapi.ConfigGeneration, error) {
+) (*livev1.ConfigGeneration, error) {
 	config := clients.GetConfiguration()
 
 	res, err := config.RegisterConfigGeneration(ctx,
-		&liveapi.RegisterConfigGenerationRequest{
+		connect.NewRequest(&livev1.RegisterConfigGenerationRequest{
 			Description: p.Description,
 			Schemas:     p.DesiredSchemas,
 			PostTypes:   p.DesiredPostTypes,
 			Activate:    true,
-		})
+		}))
 	if err != nil {
 		return nil, fmt.Errorf("register generation: %w", err)
 	}
 
-	return res.Generation, nil
+	return res.Msg.Generation, nil
 }
 
 // planPostTypes diffs the desired post types against the active
