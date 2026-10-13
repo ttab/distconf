@@ -9,8 +9,8 @@ import (
 	"github.com/ttab/clitools"
 	"github.com/ttab/distconf/distribution"
 	"github.com/ttab/distconf/live"
-	dist "github.com/ttab/elephant-public-api/distribution"
-	liveapi "github.com/ttab/elephant-public-api/live"
+	"github.com/ttab/elephant-public-api/distribution/distributionconnect"
+	"github.com/ttab/elephant-public-api/live/liveconnect"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/oauth2"
 )
@@ -26,8 +26,8 @@ func getDistributionClients(
 	}
 
 	return &distribution.StaticClients{
-		Configuration: dist.NewConfigurationProtobufClient(
-			endpoint, client),
+		Configuration: distributionconnect.NewConfigurationServiceClient(
+			client, endpoint),
 	}, nil
 }
 
@@ -42,8 +42,8 @@ func getLiveClients(
 	}
 
 	return &live.StaticClients{
-		Configuration: liveapi.NewConfigurationProtobufClient(
-			endpoint, client),
+		Configuration: liveconnect.NewConfigurationServiceClient(
+			client, endpoint),
 	}, nil
 }
 
