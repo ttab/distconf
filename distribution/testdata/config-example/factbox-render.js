@@ -9,7 +9,7 @@
 // The output is sanitized against the renderer's policy afterwards, but the
 // escaping is still this script's job: the policy decides which markup
 // survives, not what a text value means.
-export function render(req) {
+function render(req) {
   const blocks = []
 
   for (const block of req.document.content || []) {
