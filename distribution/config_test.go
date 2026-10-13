@@ -354,6 +354,257 @@ func TestReadConfigExample(t *testing.T) {
 	for docType := range wantDelivery {
 		t.Errorf("the example has no %q document", docType)
 	}
+
+	// Both shapes of gate are in the example, since it is what operators
+	// crib from: a field gate on a field the type declares as both a
+	// delivery field and a facet, and a type gate.
+	var fieldGates, typeGates int
+
+	declared := make(map[string]distribution.DocumentConfig)
+	for _, doc := range conf.Documents {
+		declared[doc.Type] = doc
+	}
+
+	for _, e := range conf.Entitlements {
+		for _, g := range e.Gates {
+			doc, ok := declared[g.DocumentType]
+			if !ok {
+				t.Errorf("entitlement %q gates %q, which the example does not configure",
+					e.Name, g.DocumentType)
+
+				continue
+			}
+
+			if g.DeliveryField == "" {
+				typeGates++
+
+				continue
+			}
+
+			fieldGates++
+
+			if !gateFieldDeclared(doc, g.DeliveryField) {
+				t.Errorf("entitlement %q gates %q on %q, which it does not "+
+					"declare as both a keyword delivery field and a "+
+					"facet with the same expression",
+					e.Name, g.DocumentType, g.DeliveryField)
+			}
+		}
+	}
+
+	if fieldGates == 0 {
+		t.Error("no entitlement in the example has a field gate")
+	}
+
+	if typeGates == 0 {
+		t.Error("no entitlement in the example has a type gate")
+	}
+}
+
+// gateFieldDeclared is the requirement the service puts on a field gate's
+// field when the generation is registered.
+func gateFieldDeclared(doc distribution.DocumentConfig, name string) bool {
+	for _, f := range doc.DeliveryFields {
+		if f.Name != name || f.Kind != distribution.KindKeyword {
+			continue
+		}
+
+		for _, facet := range doc.Facets {
+			if facet.Name == name && facet.Expression == f.Expression {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+const entitlementsHCL = `
+entitlement "preem" {
+  description = "Premium tier."
+
+  gate "core/article" {
+    delivery_field = "section"
+    values         = ["b-section", "a-section"]
+  }
+}
+
+entitlement "print-content" {
+  gate "core/print-article" {}
+}
+`
+
+// TestReadConfigEntitlements covers the syntax of both kinds of gate.
+func TestReadConfigEntitlements(t *testing.T) {
+	dir := writeConfigDir(t, map[string]string{
+		"entitlements.hcl": entitlementsHCL,
+	})
+
+	conf, err := distribution.ReadConfigFromDirectory(dir)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+
+	if len(conf.Entitlements) != 2 {
+		t.Fatalf("got %d entitlements, want 2", len(conf.Entitlements))
+	}
+
+	preem := conf.Entitlements[0]
+
+	if preem.Name != "preem" || preem.Description != "Premium tier." {
+		t.Errorf("read the first entitlement as %q %q",
+			preem.Name, preem.Description)
+	}
+
+	if len(preem.Gates) != 1 {
+		t.Fatalf("got %d gates on preem, want 1", len(preem.Gates))
+	}
+
+	gate := preem.Gates[0]
+
+	if gate.DocumentType != "core/article" ||
+		gate.DeliveryField != "section" ||
+		!slices.Equal(gate.Values, []string{"b-section", "a-section"}) {
+		t.Errorf("read the field gate as %+v", gate)
+	}
+
+	typeGated := conf.Entitlements[1]
+
+	if len(typeGated.Gates) != 1 ||
+		typeGated.Gates[0].DocumentType != "core/print-article" ||
+		typeGated.Gates[0].DeliveryField != "" ||
+		len(typeGated.Gates[0].Values) != 0 {
+		t.Errorf("read the type gate as %+v", typeGated.Gates)
+	}
+}
+
+// HCL only rejects a duplicate label within one file.
+func TestReadConfigEntitlementsDuplicateAcrossFiles(t *testing.T) {
+	dir := writeConfigDir(t, map[string]string{
+		"a.hcl": `
+entitlement "preem" {
+  gate "core/article" {}
+}
+`,
+		"b.hcl": `
+entitlement "preem" {
+  gate "core/flash" {}
+}
+`,
+	})
+
+	_, err := distribution.ReadConfigFromDirectory(dir)
+	if err == nil || !strings.Contains(err.Error(), "declared more than once") {
+		t.Fatalf("expected a duplicate entitlement error, got %v", err)
+	}
+}
+
+func TestReadConfigEntitlementRefusals(t *testing.T) {
+	cases := map[string]struct {
+		config  string
+		errPart string
+	}{
+		"a name a grant cannot name": {
+			config: `
+entitlement "Preem" {
+  gate "core/article" {}
+}
+`,
+			errPart: "the name must match",
+		},
+		"no gates": {
+			config: `
+entitlement "preem" {
+  description = "Premium tier."
+}
+`,
+			errPart: "would hide nothing",
+		},
+		"values without a field": {
+			config: `
+entitlement "preem" {
+  gate "core/article" {
+    values = ["a-section"]
+  }
+}
+`,
+			errPart: "no delivery_field",
+		},
+		"a field without values": {
+			config: `
+entitlement "preem" {
+  gate "core/article" {
+    delivery_field = "section"
+  }
+}
+`,
+			errPart: "but no values",
+		},
+		"an empty values list": {
+			config: `
+entitlement "preem" {
+  gate "core/article" {
+    delivery_field = "section"
+    values         = []
+  }
+}
+`,
+			errPart: "but no values",
+		},
+		"an empty value": {
+			config: `
+entitlement "preem" {
+  gate "core/article" {
+    delivery_field = "section"
+    values         = ["a-section", ""]
+  }
+}
+`,
+			errPart: "an empty value",
+		},
+		"one type gated twice": {
+			config: `
+entitlement "preem" {
+  gate "core/article" {
+    delivery_field = "section"
+    values         = ["a-section"]
+  }
+
+  gate "core/article" {
+    delivery_field = "section"
+    values         = ["b-section"]
+  }
+}
+`,
+			errPart: "more than once",
+		},
+		"no document type": {
+			config: `
+entitlement "preem" {
+  gate "" {}
+}
+`,
+			errPart: "no document type",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := writeConfigDir(t, map[string]string{
+				"entitlements.hcl": tc.config,
+			})
+
+			_, err := distribution.ReadConfigFromDirectory(dir)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+
+			if !strings.Contains(err.Error(), tc.errPart) {
+				t.Errorf("expected an error mentioning %q, got %v",
+					tc.errPart, err)
+			}
+		})
+	}
 }
 
 // TestReadConfigAnchors covers the anchor settings and the two ways the

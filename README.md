@@ -290,6 +290,49 @@ schema_set "public" {
   endpoint that starts answering differently has not changed its
   configuration at all.
 
+* **`entitlement`** blocks declare product tiers: content an organisation
+  only sees once it has been granted the entitlement by name. The label is
+  the name, which must match `^[a-z0-9][a-z0-9_-]*$` and may only be declared
+  once across the directory, `description` is optional, and each `gate`
+  block hides documents of the type in its label — all of them, or with
+  `delivery_field` and `values` only those whose field carries any of the
+  values. An entitlement needs at least one gate, and gates a type at most
+  once.
+
+  ```hcl
+  entitlement "preem" {
+    description = "Premium tier."
+
+    gate "core/article" {
+      delivery_field = "section"
+      values         = ["<premium section uuid>"]
+    }
+  }
+
+  entitlement "print-content" {
+    description = "Print edition content."
+    gate "core/print-article" {}
+  }
+  ```
+
+  The configuration says what an entitlement hides; **who holds it is a
+  grant**, made with `distconf distribution entitlement grant` and in effect
+  immediately. A document that the gates of several entitlements match
+  requires all of them. Gates are evaluated when content is read or
+  delivered, never stamped on what is stored, so changing one is an
+  activation and not a rewrite.
+
+  **A field gate's field has to be declared on the gated type twice**: as a
+  `keyword` delivery field and as a facet of the same name with the same
+  expression, because the service reads it from both — the delivery-field
+  row on the hot paths, the facet in the daily views. The service refuses a
+  gate where it is not, and a gate on a type no `document` block configures,
+  when the generation is registered. The values are matched exactly, so a
+  section is its `core/section` document's UUID, never its name.
+
+  **A new field gate on existing content may need a re-index** before search
+  follows it: see [How `apply` works](#how-apply-works).
+
 `distribution/testdata/config-example/` is a complete, working example of
 such a directory.
 
@@ -323,7 +366,10 @@ such a directory.
   service named by the `configuration` block to fetch its current state,
   prints a coloured diff, and on confirmation calls
   `RegisterConfigGeneration` with `activate = true`. The output reports the
-  new generation's ID.
+  new generation's ID, and any field gate search cannot yet enforce (see
+  [How `apply` works](#how-apply-works)). `--yes` skips the confirmation and
+  `--json` prints the outcome as JSON on the last line, with the uncovered
+  gates under `reindex_needed`.
 
 * **`distconf distribution sync start|stop|status`** — resumes, pauses, or
   inspects the distribution service's sync worker. `status` prints the
@@ -351,6 +397,23 @@ such a directory.
   which is the first phase of every rebuild and can take a long time. That is
   not a stall — the indexer stores no position until it starts tailing the
   log.
+
+* **`distconf distribution entitlement grant|revoke|list`** — manages which
+  organisations hold which entitlements. `grant <org> <entitlement>` and
+  `revoke <org> <entitlement>` take effect immediately on every surface: a
+  revocation refuses the next read and drops the organisation's queued
+  pushes, erasure deletion markers excepted. The organisation is the `org`
+  claim of its callers' tokens. Granting is idempotent, and so is revoking a
+  grant that does not exist; `revoke` asks first unless given `--yes`.
+  `list` takes `--org` and `--entitlement` to narrow it, and all three take
+  `--json`.
+
+  The entitlement is not checked against the configuration: a grant of one
+  the active generation does not define is kept and does nothing until a
+  generation that defines it is activated, so grants can be put in place
+  before the gate that needs them. `grant` says so when it happens, and
+  `list` shows it in the `DEFINED` column — a misspelled name looks exactly
+  like it.
 
 * **`distconf version`** — prints the binary version.
 
@@ -388,7 +451,21 @@ For distribution it also **warns** when a rendition source matches a block
 type for which no schema in the generation declares a `rel:"rendition"` link.
 Delivered documents would then carry rendition links the consumer's copy of
 the schemas rejects — the configuration is accepted, but the warning is worth
-acting on.
+acting on. Removing an `entitlement` block warns too: its gates lift, while
+its grants are kept.
+
+After a distribution apply, distconf prints the **re-index report** the
+registration returns: every field gate whose delivery field the active
+*index* generation was not built with. The search index holds a document's
+delivery fields as they were when it was indexed, so a gate on a field
+declared after a document was indexed cannot exclude it inside the query.
+The service drops such a document from the hits afterwards, so nothing of it
+is returned, but a page can come back short; its body is refused on every
+surface regardless, and the eventlog and the daily views go on listing it.
+The report is not a failure — the generation is active either way. The remedy
+is a new index generation created under the configuration that declares the
+field (`distconf distribution generation create`, `wait`, `activate`),
+followed by re-materializing the archived partitions.
 
 ## Changing a schema
 

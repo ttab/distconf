@@ -38,6 +38,11 @@ type Config struct {
 	// one block, and the first in this order wins.
 	Renderers []RendererConfig `hcl:"renderer,block"`
 
+	// Entitlements are the product tiers the generation defines, each
+	// with the gates that hide its content from an organisation that has
+	// not been granted it. See EntitlementConfig.
+	Entitlements []EntitlementConfig `hcl:"entitlement,block"`
+
 	// Schemas is populated by ReadConfigFromDirectory when WithSchemasDir
 	// is used. It contains all schemas loaded from the local directory.
 	Schemas []distconf.LoadedSchema
@@ -245,6 +250,8 @@ func ReadConfigFromDirectory(path string, opts ...ReadOption) (*Config, error) {
 		tutti.HTMLRendering = append(
 			tutti.HTMLRendering, c.HTMLRendering...)
 		tutti.Renderers = append(tutti.Renderers, c.Renderers...)
+		tutti.Entitlements = append(
+			tutti.Entitlements, c.Entitlements...)
 
 		return nil
 	})
@@ -293,6 +300,11 @@ func ReadConfigFromDirectory(path string, opts ...ReadOption) (*Config, error) {
 	}
 
 	err = resolveRenderers(tutti.Renderers)
+	if err != nil {
+		return nil, err
+	}
+
+	err = validateEntitlements(tutti.Entitlements)
 	if err != nil {
 		return nil, err
 	}

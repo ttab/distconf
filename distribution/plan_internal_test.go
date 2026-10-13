@@ -359,6 +359,9 @@ type stubConfiguration struct {
 
 	generation *distributionv1.ConfigGeneration
 	registered *distributionv1.RegisterConfigGenerationRequest
+
+	// reindexNeeded is what the registration reports back.
+	reindexNeeded []*distributionv1.GateCoverage
 }
 
 func (s *stubConfiguration) GetActiveConfigGeneration(
@@ -383,10 +386,13 @@ func (s *stubConfiguration) RegisterConfigGeneration(
 		Types:      req.GetTypes(),
 		Renditions: req.GetRenditions(),
 		Renderers:  req.GetRenderers(),
+
+		Entitlements: req.GetEntitlements(),
 	}
 
 	return connect.NewResponse(&distributionv1.RegisterConfigGenerationResponse{
-		Generation: s.generation,
+		Generation:    s.generation,
+		ReindexNeeded: s.reindexNeeded,
 	}), nil
 }
 
@@ -677,4 +683,229 @@ func TestPlanRenderersWarnings(t *testing.T) {
 			t.Errorf("no warning mentions %q: %v", part, warnings)
 		}
 	}
+}
+
+func entitlementTestConfig() *Config {
+	return &Config{
+		Entitlements: []EntitlementConfig{
+			{
+				Name: "print-content",
+				Gates: []GateConfig{
+					{DocumentType: "core/print-article"},
+				},
+			},
+			{
+				Name:        "preem",
+				Description: "Premium tier.",
+				Gates: []GateConfig{
+					{
+						DocumentType:  "core/planning-item",
+						DeliveryField: "section",
+						Values:        []string{"b", "a"},
+					},
+					{
+						DocumentType:  "core/article",
+						DeliveryField: "section",
+						Values:        []string{"b", "a", "b"},
+					},
+				},
+			},
+		},
+	}
+}
+
+// Neither the order of the entitlements, nor of a gate list, nor of a value
+// list means anything, so the payload is canonical: the server stores what
+// it was sent, and a reordering in the configuration must read back as the
+// same thing.
+func TestEntitlementsToRPCIsCanonical(t *testing.T) {
+	got := entitlementsToRPC(
+		entitlementSpecs(entitlementTestConfig().Entitlements))
+
+	if len(got) != 2 {
+		t.Fatalf("got %d entitlements, want 2", len(got))
+	}
+
+	if got[0].GetName() != "preem" || got[1].GetName() != "print-content" {
+		t.Fatalf("got the entitlements in the order %q, %q",
+			got[0].GetName(), got[1].GetName())
+	}
+
+	preem := got[0]
+
+	if preem.GetDescription() != "Premium tier." {
+		t.Errorf("got the description %q", preem.GetDescription())
+	}
+
+	var types []string
+
+	for _, g := range preem.GetGates() {
+		types = append(types, g.GetDocumentType())
+
+		cond := g.GetCondition()
+
+		if cond.GetDeliveryField() != "section" {
+			t.Errorf("gate on %q names the field %q",
+				g.GetDocumentType(), cond.GetDeliveryField())
+		}
+
+		if !slices.Equal(cond.GetValues(), []string{"a", "b"}) {
+			t.Errorf("gate on %q has the values %v, want [a b]",
+				g.GetDocumentType(), cond.GetValues())
+		}
+	}
+
+	if !slices.Equal(types, []string{"core/article", "core/planning-item"}) {
+		t.Errorf("got the gates in the order %v", types)
+	}
+
+	// A type gate has no condition at all: an empty one would read as a
+	// condition on no field.
+	if got[1].GetGates()[0].GetCondition() != nil {
+		t.Errorf("the type gate carries a condition: %v",
+			got[1].GetGates()[0].GetCondition())
+	}
+
+	if entitlementsToRPC(entitlementSpecs(nil)) != nil {
+		t.Error("no entitlements is not sent as nil")
+	}
+}
+
+func TestPlanEntitlements(t *testing.T) {
+	active := entitlementsToRPC(
+		entitlementSpecs(entitlementTestConfig().Entitlements))
+
+	// The active generation stores them in some other order; that is
+	// not a change.
+	slices.Reverse(active)
+
+	desired := entitlementTestConfig()
+
+	// Reordered values and gates, and a changed value set.
+	desired.Entitlements[1].Gates[1].Values = []string{"c", "a"}
+	slices.Reverse(desired.Entitlements[1].Gates)
+
+	// A removed and an added entitlement.
+	desired.Entitlements[0] = EntitlementConfig{
+		Name: "event-calendar",
+		Gates: []GateConfig{
+			{DocumentType: "core/event"},
+		},
+	}
+
+	changes, err := planEntitlements(
+		entitlementSpecs(desired.Entitlements), active)
+	if err != nil {
+		t.Fatalf("plan entitlements: %v", err)
+	}
+
+	described := describeChanges(changes)
+
+	if len(described) != 3 {
+		t.Fatalf("got %d changes, want 3: %v", len(described), described)
+	}
+
+	want := []string{
+		`+ define entitlement "event-calendar":`,
+		`~ update entitlement "preem":`,
+		`- remove entitlement "print-content"`,
+	}
+
+	for i, prefix := range want {
+		if !strings.HasPrefix(described[i], prefix) {
+			t.Errorf("change %d is %q, want it to start with %q",
+				i, described[i], prefix)
+		}
+	}
+
+	if !diffLine(described[1], "+", `"c"`) ||
+		!diffLine(described[1], "-", `"b"`) {
+		t.Errorf("the update does not show the value change:\n%s",
+			described[1])
+	}
+
+	if len(changes[2].Warnings()) != 1 {
+		t.Errorf("the removal carries %d warnings, want 1",
+			len(changes[2].Warnings()))
+	}
+
+	unchanged, err := planEntitlements(
+		entitlementSpecs(entitlementTestConfig().Entitlements), active)
+	if err != nil {
+		t.Fatalf("plan unchanged entitlements: %v", err)
+	}
+
+	if len(unchanged) != 0 {
+		t.Errorf("a reordered configuration reports changes: %v",
+			describeChanges(unchanged))
+	}
+}
+
+// An apply followed by a plan reports nothing for the entitlements either,
+// and Execute hands back the registration's coverage report.
+func TestApplyThenPlanEntitlements(t *testing.T) {
+	ctx := context.Background()
+
+	conf := entitlementTestConfig()
+
+	coverage := []*distributionv1.GateCoverage{{
+		Entitlement:     "preem",
+		DocumentType:    "core/article",
+		DeliveryField:   "section",
+		IndexGeneration: "brave-otter",
+	}}
+
+	stub := stubConfiguration{reindexNeeded: coverage}
+	clients := StaticClients{Configuration: &stub}
+
+	plan, err := BuildPlan(ctx, &clients, conf, nil, "first")
+	if err != nil {
+		t.Fatalf("build the first plan: %v", err)
+	}
+
+	if len(plan.Changes) != 2 {
+		t.Fatalf("got %d changes in the first plan, want 2: %v",
+			len(plan.Changes), describeChanges(plan.Changes))
+	}
+
+	res, err := plan.Execute(ctx, &clients)
+	if err != nil {
+		t.Fatalf("execute the plan: %v", err)
+	}
+
+	if len(stub.registered.GetEntitlements()) != 2 {
+		t.Errorf("the registration carried %d entitlements, want 2",
+			len(stub.registered.GetEntitlements()))
+	}
+
+	if !reflect.DeepEqual(res.GetReindexNeeded(), coverage) {
+		t.Errorf("got the coverage report %v", res.GetReindexNeeded())
+	}
+
+	if res.GetGeneration().GetId() != 1 {
+		t.Errorf("got the generation %d", res.GetGeneration().GetId())
+	}
+
+	next, err := BuildPlan(ctx, &clients, conf, nil, "second")
+	if err != nil {
+		t.Fatalf("build the second plan: %v", err)
+	}
+
+	if next.HasChanges() {
+		t.Errorf("the plan after the apply reports %d changes: %v",
+			len(next.Changes), describeChanges(next.Changes))
+	}
+}
+
+// diffLine reports whether a unified diff adds or removes, by op, a line
+// holding the text.
+func diffLine(diff string, op string, text string) bool {
+	for line := range strings.SplitSeq(diff, "\n") {
+		if strings.HasPrefix(line, op) &&
+			strings.TrimSpace(strings.TrimPrefix(line, op)) == text {
+			return true
+		}
+	}
+
+	return false
 }

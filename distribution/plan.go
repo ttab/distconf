@@ -58,6 +58,11 @@ type Plan struct {
 	// none - which is how a generation is left rendering no HTML.
 	DesiredRenderers *HTMLRenderingSpec
 
+	// DesiredEntitlements are the entitlements the generation should
+	// define, in canonical order. Nil when the configuration declares
+	// none.
+	DesiredEntitlements []EntitlementSpec
+
 	// Description is the human-readable label attached to the new
 	// generation.
 	Description string
@@ -99,6 +104,7 @@ func BuildPlan(
 		activeTypes      map[string]*distributionv1.ConfigGenerationType
 		activeRenditions map[string]*distributionv1.RenditionConfiguration
 		activeRenderers  *HTMLRenderingSpec
+		activeEntitled   []*distributionv1.Entitlement
 		currentID        int64
 	)
 
@@ -132,6 +138,8 @@ func BuildPlan(
 
 		activeRenderers = htmlRenderingFromRPC(
 			active.Generation.Renderers)
+
+		activeEntitled = active.Generation.Entitlements
 	}
 
 	renditionTypes, err := renditionLinkTypes(schemas)
@@ -165,8 +173,17 @@ func BuildPlan(
 		return nil, err
 	}
 
+	desiredEntitlements := entitlementSpecs(conf.Entitlements)
+
+	entitlementChanges, err := planEntitlements(
+		desiredEntitlements, activeEntitled)
+	if err != nil {
+		return nil, err
+	}
+
 	changes := slices.Concat(
-		schemaChanges, typeChanges, renditionChanges, rendererChanges)
+		schemaChanges, typeChanges, renditionChanges, rendererChanges,
+		entitlementChanges)
 
 	plan := Plan{
 		CurrentGenerationID: currentID,
@@ -174,6 +191,7 @@ func BuildPlan(
 		DesiredTypes:        desiredTypes,
 		DesiredRenditions:   desiredRenditions,
 		DesiredRenderers:    desiredRenderers,
+		DesiredEntitlements: desiredEntitlements,
 		Description:         description,
 		Changes:             changes,
 	}
@@ -182,10 +200,13 @@ func BuildPlan(
 }
 
 // Execute registers the desired generation and activates it. Returns the
-// newly activated generation.
+// registration response: the newly activated generation, and the field
+// gates search cannot yet enforce on all of the indexed content, which the
+// caller should show the operator - see
+// RegisterConfigGenerationResponse.reindex_needed.
 func (p *Plan) Execute(
 	ctx context.Context, clients Clients,
-) (*distributionv1.ConfigGeneration, error) {
+) (*distributionv1.RegisterConfigGenerationResponse, error) {
 	config := clients.GetConfiguration()
 
 	res, err := config.RegisterConfigGeneration(ctx,
@@ -195,13 +216,15 @@ func (p *Plan) Execute(
 			Types:       p.DesiredTypes,
 			Renditions:  p.DesiredRenditions,
 			Renderers:   htmlRenderingToRPC(p.DesiredRenderers),
-			Activate:    true,
+			Entitlements: entitlementsToRPC(
+				p.DesiredEntitlements),
+			Activate: true,
 		}))
 	if err != nil {
 		return nil, fmt.Errorf("register generation: %w", err)
 	}
 
-	return res.Msg.Generation, nil
+	return res.Msg, nil
 }
 
 // validateConfigTypes verifies that every document type configured in the

@@ -113,6 +113,7 @@ func main() {
 		Commands: []*cli.Command{
 			syncCommand(authFlags),
 			generationCommand(authFlags),
+			entitlementCommand(authFlags),
 		},
 	}
 
@@ -275,10 +276,12 @@ func applyAction(ctx context.Context, c *cli.Command) error {
 
 		return executePlan(c, plan.Changes, plan.CurrentGenerationID,
 			func() (applyResult, error) {
-				gen, err := plan.Execute(ctx, clients)
+				res, err := plan.Execute(ctx, clients)
 				if err != nil {
 					return applyResult{}, err
 				}
+
+				gen := res.Generation
 
 				return applyResult{
 					GenerationID: gen.Id,
@@ -287,6 +290,8 @@ func applyAction(ctx context.Context, c *cli.Command) error {
 					Summary: fmt.Sprintf(
 						"Activated generation %d (%d schemas, %d type configurations)",
 						gen.Id, len(gen.Schemas), len(gen.Types)),
+					ReindexNeeded: reindexNeededFromRPC(
+						res.ReindexNeeded),
 				}, nil
 			})
 	case conf.Live != nil:
@@ -338,6 +343,11 @@ type applyResult struct {
 	Types        int    `json:"types"`
 	Changes      int    `json:"changes"`
 	Summary      string `json:"summary"`
+
+	// ReindexNeeded are the field gates search cannot yet enforce on all
+	// of the indexed content, as the registration reported them. Left
+	// out when there are none, which is the normal case.
+	ReindexNeeded []gateCoverage `json:"reindex_needed,omitempty"`
 }
 
 // executePlan prints the plan diff and current state, asks for
@@ -389,6 +399,8 @@ func executePlan(
 
 	fmt.Fprintln(os.Stdout)
 	fmt.Fprintln(os.Stdout, result.Summary)
+
+	printReindexNeeded(result.ReindexNeeded)
 
 	return reportApply(c, result)
 }
