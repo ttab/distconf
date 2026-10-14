@@ -464,8 +464,11 @@ is returned, but a page can come back short; its body is refused on every
 surface regardless, and the eventlog and the daily views go on listing it.
 The report is not a failure — the generation is active either way. The remedy
 is a new index generation created under the configuration that declares the
-field (`distconf distribution generation create`, `wait`, `activate`),
-followed by re-materializing the archived partitions.
+field (`distconf distribution generation create`, `wait`, `activate`).
+The new generation's bootstrap projects archived documents from their bodies
+under the active configuration, so it needs no re-materialization afterwards;
+re-materializing partitions alone is not the remedy, since it leaves recent,
+unarchived content as it was.
 
 ## Changing a schema
 
